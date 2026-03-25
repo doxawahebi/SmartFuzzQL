@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# C / Build artifacts
+*.o
+*.obj
+*.so
+*.a
+vuln
+fuzz_target
+
+# Fuzzing
+inputs/
+outputs/
+crash-*
+leak-*
+timeout-*
+slow-unit-*
+
+# CodeQL / Static Analysis
+codeql-db/
+my-db/
+results.sarif
+.qlpack/
+
+# Script Outputs
+vulnerability_report.json
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo

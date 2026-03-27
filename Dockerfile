@@ -13,6 +13,9 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gcc \
     clang \
     make \
+    libpcap-dev \
+    bison \
+    flex \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install CodeQL CLI bundle

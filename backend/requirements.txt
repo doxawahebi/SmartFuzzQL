@@ -7,3 +7,5 @@ websockets
 psycopg2-binary
 google-genai
 rich
+docker
+requests

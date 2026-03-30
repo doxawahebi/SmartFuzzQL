@@ -10,6 +10,8 @@ import json
 import subprocess
 import docker
 import requests
+import io
+import tarfile
 
 console = Console()
 redis_client = redis.Redis.from_url(os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
@@ -32,6 +34,19 @@ def notify_status(task_id, step, status, details=None):
     except Exception as e:
         console.print(f"[red]Failed to publish to redis: {e}[/red]")
 
+def copy_text_to_container(container, target_dir: str, filename: str, content: str):
+    tar_buffer = io.BytesIO()
+    encoded_content = content.encode("utf-8")
+
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        tar_info = tarfile.TarInfo(name=filename)
+        tar_info.size = len(encoded_content)
+        tar_info.mode = 0o644
+        tar.addfile(tar_info, io.BytesIO(encoded_content))
+
+    tar_buffer.seek(0)
+    container.put_archive(target_dir, tar_buffer.getvalue())
+
 @celery_app.task(bind=True)
 def run_pipeline(self, repo_url: str):
     task_id = self.request.id
@@ -43,8 +58,7 @@ def run_pipeline(self, repo_url: str):
     try:
         notify_status(task_id, "INIT", "Running", f"Starting pipeline for {repo_url} in {temp_dir}")
         subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], capture_output=True, check=True)
-        rel_repo = os.path.basename(repo_url).replace(".git", "")
-        repo_path = os.path.join(temp_dir, rel_repo)
+        repo_path = temp_dir
         
         # Step 1: SAST (CodeQL)
         notify_status(task_id, "SAST", "Running", "Cloning and extracting source-level logical vulnerabilities via CodeQL")
@@ -116,9 +130,9 @@ def run_pipeline(self, repo_url: str):
             image_name, 
             command="tail -f /dev/null", 
             detach=True, 
-            volumes={repo_path: {'bind': '/target', 'mode': 'rw'}},
             working_dir="/target"
         )
+        copy_text_to_container(container, "/target", "harness.c", harness_code)
         
         # Compile harness
         compile_res = container.exec_run("afl-clang-fast -o fuzz_target harness.c", user="root")

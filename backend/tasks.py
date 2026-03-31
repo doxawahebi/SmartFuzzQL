@@ -68,11 +68,12 @@ def run_pipeline(self, repo_url: str):
         # For this prototype we assume codeql is locally installed and available via CLI, or use a prebuilt container
         # Since codeql is large, relying on local setup or a specific pipeline config. 
         # Fallback: if codeql missing, mock the SARIF finding for demonstration of full flow.
+        custom_ql = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom.ql")
         try:
            subprocess.run(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--command=make"], check=True, capture_output=True)
-           subprocess.run(["codeql", "database", "analyze", db_path, "cpp-queries", "--format=sarif-latest", f"--output={sarif_path}"], check=True, capture_output=True)
+           subprocess.run(["codeql", "database", "analyze", db_path, custom_ql, "--format=sarif-latest", f"--output={sarif_path}"], check=True, capture_output=True)
         except FileNotFoundError:
-           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found locally. Mocking SARIF for fuzzing step.")
+           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found. Mocking SARIF for fuzzing step.")
            mock_sarif = {
                "runs": [
                    {"results": [

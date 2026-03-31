@@ -172,7 +172,8 @@ def run_pipeline(self, repo_url: str):
         container.exec_run("mkdir -p inputs outputs", user="root")
         container.exec_run("sh -c 'echo A > inputs/seed'", user="root")
         
-        fuzz_cmd = "afl-fuzz -i inputs -o outputs -- ./fuzz_target"
+        notify_status(task_id, "DAST", "Running", f"Starting AFL++ fuzzing... This may take up to {TIME_MINITUTE} minutes. Monitoring for crashes.")
+        fuzz_cmd = "afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
         container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
         
         # Poll for 20 minutes

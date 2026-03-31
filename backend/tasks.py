@@ -121,9 +121,27 @@ def run_pipeline(self, repo_url: str):
         )
         
         # Compile harness
-        compile_res = container.exec_run("afl-clang-fast -o fuzz_target harness.c", user="root")
+        compile_cmd = "afl-clang-fast -o fuzz_target harness.c"
+        compile_res = container.exec_run(compile_cmd, user="root", demux=True)
+
         if compile_res.exit_code != 0:
-            raise Exception(f"Failed to compile harness: {compile_res.output.decode('utf-8')}")
+            # When demux=True is set, compile_res.output returns a (stdout_bytes, stderr_bytes) tuple.
+            stdout_bytes, stderr_bytes  ='replace'
+            stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else "No STDOUT"
+            stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else "No STDERR"
+            
+            # Detailed error message formatting for better debugging of compilation issues
+            error_msg = (
+                f"Failed to compile harness!\n"
+                f"[Command]  {compile_cmd}\n"
+                f"[Exit Code] {compile_res.exit_code}\n"
+                f"{'-'*20} STDOUT {'-'*20}\n"
+                f"{stdout_str}\n"
+                f"{'-'*20} STDERR {'-'*20}\n"
+                f"{stderr_str}\n"
+                f"{'-'*48}"
+            )
+            raise Exception(error_msg)
 
         # Setup basic inputs and run afl-fuzz
         container.exec_run("mkdir -p inputs outputs", user="root")

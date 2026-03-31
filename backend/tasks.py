@@ -378,7 +378,7 @@ DO NOT include commands like `apt-get install` or any markdown formatting.
 Just the package names, for example: pkg-config libssl-dev zlib1g-dev
 """
         if feedback_context:
-            prompt += "\n\nPrevious Docker build attempts failed with these errors. Please fix the missing dependencies or build commands:\n"
+            prompt += "\n\nPrevious build attempts failed with these errors. Please fix/add the missing dependencies:\n"
             for fb in feedback_context:
                 prompt += f"{fb}\n"
                 
@@ -404,10 +404,10 @@ Just the package names, for example: pkg-config libssl-dev zlib1g-dev
             ["docker", "build", "-f", workspace_dockerfile_path, "-t", f"dynamic-fuzzer-{task_id}", build_dir],
             capture_output=True, text=True
         )
-        shutil.rmtree(build_dir, ignore_errors=True)
         
         if build_process.returncode == 0:
             notify_status(task_id, "ENV_GEN", "Success", "Docker image built successfully with AFL instrumentation!")
+            shutil.rmtree(build_dir, ignore_errors=True)
             return {"status": "Success", "image": f"dynamic-fuzzer-{task_id}"}
         else:
             # 4. Build Error Feedback Loop
@@ -418,7 +418,8 @@ Just the package names, for example: pkg-config libssl-dev zlib1g-dev
             if len(error_log) > 2000:
                 error_log = "..." + error_log[-2000:]
                 
-            feedback_context.append(f"Attempt {attempt} failed.\nDockerfile:\n{dockerfile_content}\n\nBuild Error:\n{error_log}")
+            feedback_context.append(f"Attempt {attempt} failed.\nDeps Used: {target_deps}\n\nBuild Error:\n{error_log}")
             
     notify_status(task_id, "ENV_GEN", "Failed", f"Failed to build Dockerfile after {max_retries} attempts.")
+    shutil.rmtree(build_dir, ignore_errors=True)
     return {"status": "Failed", "error": "Max retries exceeded"}

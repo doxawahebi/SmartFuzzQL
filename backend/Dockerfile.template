@@ -1,0 +1,48 @@
+# Layer 1: Base Image & Env 
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Layer 2: OS Dependencies (Highly Cached)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    automake \
+    cmake \
+    git \
+    flex \
+    bison \
+    libglib2.0-dev \
+    libpixman-1-dev \
+    libtool-bin \
+    clang-14 \
+    llvm-14-dev \
+    llvm-14-tools \
+    lld-14 \
+    wget \
+    nano \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 3: AFL++ Build (Highly Cached)
+WORKDIR /afl
+RUN git clone --depth 1 -b v4.21c https://github.com/AFLplusplus/AFLplusplus.git . \
+    && LLVM_CONFIG=llvm-config-14 make source-only
+
+# Setup AFL++ in PATH
+ENV PATH="/afl:${PATH}"
+ENV AFL_CC=/usr/bin/clang-14
+ENV AFL_CXX=/usr/bin/clang++-14
+
+# Layer 4: Dynamic Target Injection (Moderately Cached)
+RUN apt-get update && apt-get install -y {{ TARGET_DEPS }} && rm -rf /var/lib/apt/lists/*
+
+# Layer 5: Volatile Payload (Rarely Cached)
+# During the pipeline, the repository is cloned locally and passed in via build context
+WORKDIR /target
+COPY . /target
+
+# Set AFL++ Compilers for subsequent target builds
+ENV CC=afl-clang-fast
+ENV CXX=afl-clang-fast++
+
+# Default entrypoint for manual debugging if the pipeline doesn't override it
+CMD ["/bin/bash"]

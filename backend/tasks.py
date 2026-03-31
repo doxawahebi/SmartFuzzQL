@@ -122,7 +122,7 @@ def run_pipeline(self, repo_url: str):
         # Step 2: AI Harness Generation
         notify_status(task_id, "AI_HARNESS", "Running", "Requesting source-code level C harness from LLM")
         prompt = f"Write a complete C harness for AFL++ targeting this file: {vuln_file}. Vulnerability: {vuln_msg}\nSource Code:\n```c\n{vuln_code}\n```"
-        llm_resp = call_llm_api(prompt)
+        llm_resp = call_llm_api(prompt, model='gemini-2.5-flash', task_type='harness')
         harness_code = extract_c_code(llm_resp) # need to add this helper
         harness_path = os.path.join(repo_path, "harness.c")
         with open(harness_path, "w") as f: f.write(harness_code)
@@ -206,7 +206,7 @@ def run_pipeline(self, repo_url: str):
         # Step 4: AI Patch Generation
         notify_status(task_id, "AI_PATCH", "Running", "Crash verified. Querying LLM for source-code secure patch")
         patch_prompt = f"Fix the vulnerability in this code. Crash input (hex): {crash_data.hex() if crash_data else 'Unknown'}\nVulnerability: {vuln_msg}\nSource:\n```c\n{vuln_code}\n```. Provide ONLY the correct patched C code inside ```c block."
-        patch_resp = call_llm_api(patch_prompt)
+        patch_resp = call_llm_api(patch_prompt, model='gemini-2.5-flash', task_type='patch')
         patch_code = extract_c_code(patch_resp)
         patch_path = os.path.join(repo_path, "patched_" + os.path.basename(vuln_file))
         with open(patch_path, "w") as f: f.write(patch_code)
@@ -242,7 +242,33 @@ def extract_c_code(llm_response):
         return llm_response[start:end].strip()
     return llm_response.strip()
 
-def call_llm_api(prompt):
+def call_llm_api(prompt, model='gemini-2.5-flash', task_type=None):
+    if os.environ.get("DEBUG_BYPASS_LLM", "False").lower() in ("true", "1", "yes"):
+        debug_assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_assets")
+        
+        if task_type == "harness" or "Write a complete C harness" in prompt or "Fix the errors based on the compiler output" in prompt:
+            mock_file = os.path.join(debug_assets_dir, "mock_harness.c")
+            if not os.path.exists(mock_file):
+                console.print(f"[red][DEBUG] {mock_file} not found[/red]")
+                raise Exception(f"[DEBUG] {mock_file} not found")
+            with open(mock_file, "r") as f:
+                return f.read()
+
+        elif task_type == "patch" or "Fix the vulnerability in this code" in prompt:
+            mock_file = os.path.join(debug_assets_dir, "mock_patch.c")
+            if not os.path.exists(mock_file):
+                console.print(f"[red][DEBUG] {mock_file} not found[/red]")
+                raise Exception(f"[DEBUG] {mock_file} not found")
+            with open(mock_file, "r") as f:
+                return f.read()
+                
+        elif task_type == "docker_deps" or "configuring an AFL++ fuzzing environment" in prompt:
+            mock_file = os.path.join(debug_assets_dir, "mock_deps.txt")
+            if os.path.exists(mock_file):
+                with open(mock_file, "r") as f:
+                    return f.read()
+            return "pkg-config libssl-dev zlib1g-dev"
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return "ERROR: GEMINI_API_KEY not set"
@@ -323,8 +349,10 @@ Output ONLY the Dockerfile inside a ```dockerfile block.
             for fb in feedback_context:
                 prompt += f"{fb}\n"
                 
-        llm_response = call_llm_api(prompt)
-        dockerfile_content = extract_dockerfile(llm_response)
+        llm_response = call_llm_api(prompt, task_type='docker_deps')
+        
+        # Clean the response to ensure only space-separated packages are present
+        target_deps = llm_response.replace("```text", "").replace("```", "").replace("\n", " ").strip()
         
         if "ERROR" in dockerfile_content:
             notify_status(task_id, "ENV_GEN", "Failed", f"LLM Error: {dockerfile_content}")

@@ -4,6 +4,7 @@ import tempfile
 import shutil
 import redis
 from rich.console import Console
+from rich.markup import escape
 from google import genai
 import os
 import json
@@ -25,7 +26,7 @@ celery_app = Celery(
 def notify_status(task_id, step, status, details=None):
     # Rich print for CMD logs
     color = "green" if status == "Success" else "red" if status == "Failed" else "cyan"
-    console.print(f"[{color}][{step}][/{color}] {status} - {details}")
+    console.print(f"[{color}][{step}][/{color}] {status} - {escape(str(details or ''))}")
     
     # Broadcast to Redis PubSub for WebSockets
     message = json.dumps({"task_id": task_id, "step": step, "status": status, "details": details})
@@ -68,11 +69,21 @@ def run_pipeline(self, repo_url: str):
         # For this prototype we assume codeql is locally installed and available via CLI, or use a prebuilt container
         # Since codeql is large, relying on local setup or a specific pipeline config. 
         # Fallback: if codeql missing, mock the SARIF finding for demonstration of full flow.
+        custom_ql = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom.ql")
+        def run_codeql_streaming(cmd):
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    notify_status(task_id, "SAST", "Running", line)
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
         try:
-           subprocess.run(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--command=make"], check=True, capture_output=True)
-           subprocess.run(["codeql", "database", "analyze", db_path, "cpp-queries", "--format=sarif-latest", f"--output={sarif_path}"], check=True, capture_output=True)
+           run_codeql_streaming(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--build-mode=none"])
+           run_codeql_streaming(["codeql", "database", "analyze", db_path, custom_ql, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
         except FileNotFoundError:
-           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found locally. Mocking SARIF for fuzzing step.")
+           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found. Mocking SARIF for fuzzing step.")
            mock_sarif = {
                "runs": [
                    {"results": [

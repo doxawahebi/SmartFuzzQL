@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies needed for pipeline (git, build-essential, curl, docker, wget)
 RUN apt-get update && \
-    apt-get install -y git build-essential curl docker.io clang cmake wget && \
+    apt-get install -y git build-essential curl docker.io clang cmake wget autoconf automake libtool pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
 # Install CodeQL CLI

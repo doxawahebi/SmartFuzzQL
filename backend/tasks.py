@@ -4,12 +4,15 @@ import tempfile
 import shutil
 import redis
 from rich.console import Console
+from rich.markup import escape
 from google import genai
 import os
 import json
 import subprocess
 import docker
 import requests
+import io
+import tarfile
 
 console = Console()
 redis_client = redis.Redis.from_url(os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
@@ -23,7 +26,7 @@ celery_app = Celery(
 def notify_status(task_id, step, status, details=None):
     # Rich print for CMD logs
     color = "green" if status == "Success" else "red" if status == "Failed" else "cyan"
-    console.print(f"[{color}][{step}][/{color}] {status} - {details}")
+    console.print(f"[{color}][{step}][/{color}] {status} - {escape(str(details or ''))}")
     
     # Broadcast to Redis PubSub for WebSockets
     message = json.dumps({"task_id": task_id, "step": step, "status": status, "details": details})
@@ -31,6 +34,19 @@ def notify_status(task_id, step, status, details=None):
         redis_client.publish('pipeline_logs', message)
     except Exception as e:
         console.print(f"[red]Failed to publish to redis: {e}[/red]")
+
+def copy_text_to_container(container, target_dir: str, filename: str, content: str):
+    tar_buffer = io.BytesIO()
+    encoded_content = content.encode("utf-8")
+
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        tar_info = tarfile.TarInfo(name=filename)
+        tar_info.size = len(encoded_content)
+        tar_info.mode = 0o644
+        tar.addfile(tar_info, io.BytesIO(encoded_content))
+
+    tar_buffer.seek(0)
+    container.put_archive(target_dir, tar_buffer.getvalue())
 
 @celery_app.task(bind=True)
 def run_pipeline(self, repo_url: str):
@@ -43,8 +59,7 @@ def run_pipeline(self, repo_url: str):
     try:
         notify_status(task_id, "INIT", "Running", f"Starting pipeline for {repo_url} in {temp_dir}")
         subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], capture_output=True, check=True)
-        rel_repo = os.path.basename(repo_url).replace(".git", "")
-        repo_path = os.path.join(temp_dir, rel_repo)
+        repo_path = temp_dir
         
         # Step 1: SAST (CodeQL)
         notify_status(task_id, "SAST", "Running", "Cloning and extracting source-level logical vulnerabilities via CodeQL")
@@ -54,11 +69,21 @@ def run_pipeline(self, repo_url: str):
         # For this prototype we assume codeql is locally installed and available via CLI, or use a prebuilt container
         # Since codeql is large, relying on local setup or a specific pipeline config. 
         # Fallback: if codeql missing, mock the SARIF finding for demonstration of full flow.
+        custom_ql = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom.ql")
+        def run_codeql_streaming(cmd):
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    notify_status(task_id, "SAST", "Running", line)
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
         try:
-           subprocess.run(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--command=make"], check=True, capture_output=True)
-           subprocess.run(["codeql", "database", "analyze", db_path, "cpp-queries", "--format=sarif-latest", f"--output={sarif_path}"], check=True, capture_output=True)
+           run_codeql_streaming(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--build-mode=none"])
+           run_codeql_streaming(["codeql", "database", "analyze", db_path, custom_ql, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
         except FileNotFoundError:
-           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found locally. Mocking SARIF for fuzzing step.")
+           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found. Mocking SARIF for fuzzing step.")
            mock_sarif = {
                "runs": [
                    {"results": [
@@ -116,9 +141,9 @@ def run_pipeline(self, repo_url: str):
             image_name, 
             command="tail -f /dev/null", 
             detach=True, 
-            volumes={repo_path: {'bind': '/target', 'mode': 'rw'}},
             working_dir="/target"
         )
+        copy_text_to_container(container, "/target", "harness.c", harness_code)
         
         # Compile harness
         compile_cmd = "afl-clang-fast -o fuzz_target harness.c"

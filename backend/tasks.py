@@ -320,10 +320,10 @@ def extract_dockerfile(text):
 def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
     notify_status(task_id, "ENV_GEN", "Running", f"Analyzing target repository {repo_url} for build dependencies")
     
-    # 1. Target Analysis: Fetch build files
-    temp_dir = tempfile.mkdtemp(prefix="target_analyze_")
+    # 1. Target Analysis & Build Context Setup
+    build_dir = tempfile.mkdtemp(prefix="docker_build_")
     try:
-        subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], capture_output=True, check=True)
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, build_dir], capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
         notify_status(task_id, "ENV_GEN", "Failed", f"Failed to clone repository: {e.stderr}")
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -332,7 +332,7 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
     build_context = ""
     critical_files = ["README.md", "configure", "configure.ac", "CMakeLists.txt", "Makefile", "autogen.sh"]
     for file_name in critical_files:
-        file_path = os.path.join(temp_dir, file_name)
+        file_path = os.path.join(build_dir, file_name)
         if os.path.exists(file_path):
             with open(file_path, "r", errors="ignore") as f:
                 content = f.read()
@@ -347,27 +347,35 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
     max_retries = 3
     feedback_context = []
     
+    # Locate templates in the backend directory
+    # TODO : save dynamic-fuzzer.Dockerfile in DB.
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(backend_dir, "Dockerfile.template")
+    workspace_dockerfile_path = os.path.join(os.path.dirname(backend_dir), "dynamic-fuzzer.Dockerfile")
+
+    try:
+        with open(template_path, "r") as f:
+            template_content = f.read()
+    except FileNotFoundError:
+        notify_status(task_id, "ENV_GEN", "Failed", "Dockerfile.template not found.")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        return {"status": "Failed", "error": "Dockerfile.template missing"}
+    
     for attempt in range(1, max_retries + 1):
-        notify_status(task_id, "ENV_GEN", "Running", f"Generating Dockerfile (Attempt {attempt}/{max_retries})")
+        notify_status(task_id, "ENV_GEN", "Running", f"Generating dependencies via LLM (Attempt {attempt}/{max_retries})")
         
-        # 2. Dynamic Dockerfile Generation
+        # 2. Dependency Resolution via LLM
         prompt = f"""
-You are an expert DevSecOps engineer configuring an AFL++ fuzzing environment.
-Please write a complete Dockerfile to compile the following project for fuzzing.
+You are an expert DevSecOps engineer configuring an AFL++ fuzzing environment on Ubuntu 22.04.
+Analyze the target repository's build files and determine its system dependencies (e.g., libpcap-dev, libssl-dev, pkg-config).
 
 Project Repository: {repo_url}
-
-Based on these snippets from the repository's build files, determine its system dependencies (e.g., libpcap-dev, libssl-dev, cmake, autoconf):
+Build Files Context:
 {build_context}
 
-Requirements:
-- Base image: `ubuntu:24.04`
-- Install standard build tools (build-essential, clang, git, wget) AND target-specific dependencies.
-- Install AFL++ (either via apt fuzzing tools, or clone and build AFL++). Assume AFL is available in PATH.
-- Clone the target repository (`git clone {repo_url} /target`).
-- Compile the target software. Inject AFL++ compilers by setting `CC=afl-clang-fast` and `CXX=afl-clang-fast++` before running `make` or `cmake`.
-
-Output ONLY the Dockerfile inside a ```dockerfile block.
+Output ONLY a space-separated list of required Ubuntu `apt` packages. 
+DO NOT include commands like `apt-get install` or any markdown formatting.
+Just the package names, for example: pkg-config libssl-dev zlib1g-dev
 """
         if feedback_context:
             prompt += "\n\nPrevious Docker build attempts failed with these errors. Please fix the missing dependencies or build commands:\n"
@@ -377,11 +385,12 @@ Output ONLY the Dockerfile inside a ```dockerfile block.
         llm_response = call_llm_api(prompt, task_type='docker_deps')
         
         # Clean the response to ensure only space-separated packages are present
-        target_deps = llm_response.replace("```text", "").replace("```", "").replace("\n", " ").strip()
+        target_deps = llm_response.replace("```dockerfile", "").replace("```", "").replace("\n", " ").strip()
         
-        if "ERROR" in dockerfile_content:
-            notify_status(task_id, "ENV_GEN", "Failed", f"LLM Error: {dockerfile_content}")
-            return {"status": "Failed", "error": dockerfile_content}
+        if "ERROR" in target_deps:
+            notify_status(task_id, "ENV_GEN", "Failed", f"LLM Error: {target_deps}")
+            shutil.rmtree(build_dir, ignore_errors=True)
+            return {"status": "Failed", "error": target_deps}
             
         # 3. Dockerfile Injection
         dockerfile_content = template_content.replace("{{ TARGET_DEPS }}", target_deps)
@@ -390,9 +399,9 @@ Output ONLY the Dockerfile inside a ```dockerfile block.
         with open(workspace_dockerfile_path, "w") as f:
             f.write(dockerfile_content)
             
-        notify_status(task_id, "ENV_GEN", "Running", "Building Docker image orchestrator locally...")
+        notify_status(task_id, "ENV_GEN", "Running", f"Building Docker orchestrator locally... Injecting: {target_deps}")
         build_process = subprocess.run(
-            ["docker", "build", "-t", f"dynamic-fuzzer-{task_id}", build_dir],
+            ["docker", "build", "-f", workspace_dockerfile_path, "-t", f"dynamic-fuzzer-{task_id}", build_dir],
             capture_output=True, text=True
         )
         shutil.rmtree(build_dir, ignore_errors=True)

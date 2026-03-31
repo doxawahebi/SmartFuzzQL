@@ -52,7 +52,7 @@ def copy_text_to_container(container, target_dir: str, filename: str, content: s
 def run_pipeline(self, repo_url: str):
     task_id = self.request.id
     temp_dir = tempfile.mkdtemp(prefix=f"pipeline_run_{task_id}_")
-    print(f"temp_dir : {temp_dir}")
+    console.print(f"temp_dir : {temp_dir}")
     docker_client = docker.from_env()
     container = None
     
@@ -145,11 +145,20 @@ def run_pipeline(self, repo_url: str):
         )
         copy_text_to_container(container, "/target", "harness.c", harness_code)
         
-        # Compile harness
-        compile_cmd = "afl-clang-fast -o fuzz_target harness.c"
-        compile_res = container.exec_run(compile_cmd, user="root", demux=True)
+        # Compile harness with feedback loop
+        compile_cmd = "afl-clang-fast -I/usr/local/include/afl++ -o fuzz_target harness.c"
+        max_compile_retries = 3
+        compile_success = False
 
-        if compile_res.exit_code != 0:
+        for attempt in range(1, max_compile_retries + 1):
+            notify_status(task_id, "DAST", "Running", f"Compiling harness (Attempt {attempt}/{max_compile_retries})...")
+            compile_res = container.exec_run(compile_cmd, user="root", demux=True)
+
+            if compile_res.exit_code == 0:
+                compile_success = True
+                notify_status(task_id, "DAST", "Success", "Harness compiled successfully.")
+                break
+
             # When demux=True is set, compile_res.output returns a (stdout_bytes, stderr_bytes) tuple.
             stdout_bytes, stderr_bytes  ='replace'
             stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else "No STDOUT"
@@ -166,7 +175,24 @@ def run_pipeline(self, repo_url: str):
                 f"{stderr_str}\n"
                 f"{'-'*48}"
             )
-            raise Exception(error_msg)
+
+            if attempt == max_compile_retries:
+                raise Exception(error_msg)
+            else:
+                notify_status(task_id, "DAST", "Warning", f"Compilation failed. Requesting quick fix from LLM...")
+                fix_prompt = f"The following C harness failed to compile. Fix the errors based on the compiler output and return only the corrected complete C code. Do not explain.\n\nCompiler Output:\n{stderr_str}\n\nBroken Harness:\n```c\n{harness_code}\n```"
+                fix_resp = call_llm_api(fix_prompt, model='gemini-2.5-flash', task_type='harness')
+                harness_code = extract_c_code(fix_resp)
+                
+                # Update the local file and container
+                with open(harness_path, "w") as f: f.write(harness_code)
+                copy_text_to_container(container, "/target", "harness.c", harness_code)
+
+        if not compile_success:
+            raise Exception("Failed to compile harness after maximum retries.")
+
+        TIME_MINITUTE = 1
+        POLL_INTERVAL = 10
 
         # Setup basic inputs and run afl-fuzz
         container.exec_run("mkdir -p inputs outputs", user="root")
@@ -274,9 +300,8 @@ def call_llm_api(prompt, model='gemini-2.5-flash', task_type=None):
         return "ERROR: GEMINI_API_KEY not set"
     client = genai.Client(api_key=api_key)
     try:
-        # Using a potentially lighter model for retry loops
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=model,
             contents=prompt,
         )
         return response.text
@@ -290,9 +315,9 @@ def extract_dockerfile(text):
         return text[start:end].strip()
     return text.strip()
 
-# @celery_app.task(bind=True)
-#def build_dynamic_fuzzing_env(self, repo_url: str):
-def build_dynamic_fuzzing_env(repo_url: str, task_id: str):
+#def build_dynamic_fuzzing_env(repo_url: str, task_id: str):
+@celery_app.task(bind=True)
+def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
     notify_status(task_id, "ENV_GEN", "Running", f"Analyzing target repository {repo_url} for build dependencies")
     
     # 1. Target Analysis: Fetch build files
@@ -358,10 +383,11 @@ Output ONLY the Dockerfile inside a ```dockerfile block.
             notify_status(task_id, "ENV_GEN", "Failed", f"LLM Error: {dockerfile_content}")
             return {"status": "Failed", "error": dockerfile_content}
             
-        # 3. Automated Build Process
-        build_dir = tempfile.mkdtemp(prefix="docker_build_")
-        dockerfile_path = os.path.join(build_dir, "Dockerfile")
-        with open(dockerfile_path, "w") as f:
+        # 3. Dockerfile Injection
+        dockerfile_content = template_content.replace("{{ TARGET_DEPS }}", target_deps)
+        
+        # Save to Workspace Dockerfile explicitly for user review if needed
+        with open(workspace_dockerfile_path, "w") as f:
             f.write(dockerfile_content)
             
         notify_status(task_id, "ENV_GEN", "Running", "Building Docker image orchestrator locally...")

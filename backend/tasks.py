@@ -106,18 +106,24 @@ def run_pipeline(self, repo_url: str):
             
         vuln_msg = "Unknown vulnerability"
         vuln_file = "unknown"
+        # TODO : Does this code get the data from sarif correctly?
         results = sarif_data.get("runs", [{}])[0].get("results", [])
+        console.print(f"results : {results}")
         if results:
             vuln_msg = results[0].get("message", {}).get("text", "")
+            console.print(f"vuln_msg : {vuln_msg}")
             locations = results[0].get("locations", [])
+            console.print(f"locations : {locations}")
             if locations:
                 vuln_file = locations[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
 
         vuln_file_full = os.path.join(repo_path, vuln_file)
-        print(f"vuln_file_full: {vuln_file_full}")
-        vuln_code = "Code not found"
+        console.print(f"vuln_file_full: {vuln_file_full}")
+        # vuln_code = "Code not found"
+        vuln_code = "Code not found 243234234234234234"
         if os.path.exists(vuln_file_full):
              with open(vuln_file_full, "r") as f: vuln_code = f.read()
+        console.print(f"vuln_code : {vuln_code}")
 
         # Step 2: AI Harness Generation
         notify_status(task_id, "AI_HARNESS", "Running", "Requesting source-code level C harness from LLM")
@@ -125,6 +131,8 @@ def run_pipeline(self, repo_url: str):
         llm_resp = call_llm_api(prompt, model='gemini-2.5-flash', task_type='harness')
         harness_code = extract_c_code(llm_resp) # need to add this helper
         harness_path = os.path.join(repo_path, "harness.c")
+        console.print(f"harness_path : {harness_path}")
+        console.print(f"harness_code : {harness_code}")
         with open(harness_path, "w") as f: f.write(harness_code)
         
         # Step 3: DAST (AFL++)
@@ -143,6 +151,15 @@ def run_pipeline(self, repo_url: str):
             detach=True, 
             working_dir="/target"
         )
+        
+        # 409 error : Check if container is running
+        container.reload() 
+        console.print(f"Container status: {container.status}")
+
+        if container.status != "running":
+            console.print("Container logs:", container.logs().decode('utf-8'))
+            raise Exception("컨테이너가 정상적으로 실행되지 않았습니다.")
+        
         copy_text_to_container(container, "/target", "harness.c", harness_code)
         
         # Compile harness with feedback loop
@@ -160,11 +177,10 @@ def run_pipeline(self, repo_url: str):
                 break
 
             # When demux=True is set, compile_res.output returns a (stdout_bytes, stderr_bytes) tuple.
-            stdout_bytes, stderr_bytes  ='replace'
+            stdout_bytes, stderr_bytes = compile_res.output
             stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else "No STDOUT"
             stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else "No STDERR"
             
-            # Detailed error message formatting for better debugging of compilation issues
             error_msg = (
                 f"Failed to compile harness!\n"
                 f"[Command]  {compile_cmd}\n"
@@ -202,17 +218,30 @@ def run_pipeline(self, repo_url: str):
         fuzz_cmd = "afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
         container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
         
+        # Read the background process logs to verify it started correctly
+        time.sleep(2)
+        fuzzer_stdout = container.exec_run("cat fuzzer_stdout.log", user="root")
+        fuzzer_stderr = container.exec_run("cat fuzzer_stderr.log", user="root")
+        console.print(f"[DEBUG] AFL++ STDOUT:\n{fuzzer_stdout.output.decode('utf-8', errors='replace')}")
+        console.print(f"[DEBUG] AFL++ STDERR:\n{fuzzer_stderr.output.decode('utf-8', errors='replace')}")
+        
+        notify_status(task_id, "DAST", "Running", f"Fuzzer started. Polling for crashes every {POLL_INTERVAL} seconds...")
+        
         # Poll for 20 minutes
-        timeout = 20 * 60
+        timeout = TIME_MINITUTE * 60
         start = time.time()
         crash_found = False
         crash_data = None
         
         while time.time() - start < timeout:
+            console.print(f"[DEBUG] Polling loop running... Elapsed: {time.time() - start:.1f}s")
             stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
             if stats.exit_code == 0:
                 stats_str = stats.output.decode('utf-8')
                 notify_status(task_id, "DAST", "Running", f"Fuzzer running... Stats:\n{stats_str[:200]}...") # Truncated
+            else:
+                # No stats file yet
+                console.print(f"[DEBUG] fuzzer_stats not found yet. Exit code: {stats.exit_code}")
             
             crashes = container.exec_run("sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root")
             if crashes.exit_code == 0 and crashes.output.decode('utf-8').strip():
@@ -223,7 +252,7 @@ def run_pipeline(self, repo_url: str):
                      crash_data = crash_content.output
                 notify_status(task_id, "DAST", "Success", "Crash found!")
                 break
-            time.sleep(10) # Poll every 10 seconds
+            time.sleep(POLL_INTERVAL) # Poll every POLL_INTERVAL seconds
             
         if not crash_found:
             notify_status(task_id, "DAST", "Failed", "No crash found within timeout")
@@ -326,7 +355,7 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
         subprocess.run(["git", "clone", "--depth", "1", repo_url, build_dir], capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
         notify_status(task_id, "ENV_GEN", "Failed", f"Failed to clone repository: {e.stderr}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(build_dir, ignore_errors=True)
         return {"status": "Failed", "error": f"Clone failed: {e.stderr}"}
 
     build_context = ""
@@ -340,9 +369,6 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
                 if len(content) > 3000:
                     content = content[:3000] + "\n...[TRUNCATED]..."
                 build_context += f"\n--- {file_name} ---\n{content}\n"
-    
-    # We no longer need the local clone once we have the context
-    shutil.rmtree(temp_dir, ignore_errors=True)
     
     max_retries = 3
     feedback_context = []

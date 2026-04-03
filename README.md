@@ -62,11 +62,11 @@ SAST의 Source-code level analysis 결과를 LLM에 주입하여 Fuzzing Harness
 - Gemini / LLM (Prompt Engineering)
 - AFL++ (Fuzzer)
 
-## 👥 Contributors
+## Contributors
 
 - **김찬 (Member 1)** - Backend / Infra / Prompt Engineering / SAST Pipeline & AFL++ Environment, Feedback Loop Design
 - **윤종현 (Member 2)** - Frontend / Backend / DB Schema & API Orchestration, React Flow / Monaco Editor Integration
 
-## 📚 References
+## References
 - [AFL++ : Combining Incremental Steps of Fuzzing Research](https://github.com/AFLplusplus/AFLplusplus)
 - [GitHub CodeQL Overview](https://codeql.github.com/docs/codeql-overview/about-codeql/)

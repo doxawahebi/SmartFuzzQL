@@ -1,9 +1,20 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import asyncio
+import json
 import os
+import uuid
+from datetime import datetime, timezone
+
 import redis.asyncio as redis
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import case, func
+from sqlalchemy.orm import Session
+
+import database
+import models
+from database import SessionLocal, get_db
+from models import Job
 from tasks import run_pipeline
 
 app = FastAPI(title="HAST Pipeline API")
@@ -16,8 +27,117 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Request / response schemas — existing public API
+# ---------------------------------------------------------------------------
+
 class JobRequest(BaseModel):
     repo_url: str
+    submitted_by: str | None = None
+
+
+class VulnFinding(BaseModel):
+    message: str
+    file: str
+    code_snippet: str | None = None
+
+
+class PipelineResult(BaseModel):
+    repo: str
+    vuln_msg: str
+    vuln_file: str
+    patch_generated: bool
+    crash_hex: str | None = None
+    patch_code: str | None = None
+
+
+class JobSummary(BaseModel):
+    task_id: str
+    state: str
+    repo_url: str | None = None
+    submitted_at: str | None = None
+
+
+class JobStatusResponse(BaseModel):
+    task_id: str
+    state: str
+    vuln: VulnFinding | None = None
+    result: PipelineResult | None = None
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard schemas
+# ---------------------------------------------------------------------------
+
+class AdminJobSummary(BaseModel):
+    """One row in the admin job list / recent-jobs array."""
+    model_config = ConfigDict(from_attributes=True)
+
+    task_id: str
+    repo_url: str
+    submitted_by: str | None = None
+    state: str
+    submitted_at: datetime
+    completed_at: datetime | None = None
+    patch_generated: bool | None = None
+
+
+class AdminJobDetail(BaseModel):
+    """Full job record including vulnerability and patch fields."""
+    model_config = ConfigDict(from_attributes=True)
+
+    task_id: str
+    repo_url: str
+    submitted_by: str | None = None
+    state: str
+    submitted_at: datetime
+    completed_at: datetime | None = None
+    vuln_message: str | None = None
+    vuln_file: str | None = None
+    code_snippet: str | None = None
+    patch_generated: bool | None = None
+    crash_hex: str | None = None
+    patch_code: str | None = None
+
+
+class AdminDashboardResponse(BaseModel):
+    """Aggregate stats plus the most recent 50 jobs."""
+    total_jobs: int
+    pending: int
+    running: int
+    succeeded: int
+    failed: int
+    recent_jobs: list[AdminJobSummary]
+
+
+class AdminJobsListResponse(BaseModel):
+    """Paginated, filterable job list."""
+    total: int
+    page: int
+    page_size: int
+    items: list[AdminJobSummary]
+
+
+class UserStats(BaseModel):
+    """Per-user job statistics."""
+    submitted_by: str | None = None
+    total_jobs: int
+    succeeded: int
+    failed: int
+    last_submitted_at: datetime
+
+
+class AdminUsersResponse(BaseModel):
+    items: list[UserStats]
+
+
+# ---------------------------------------------------------------------------
+# In-memory job store (real-time WebSocket state)
+# ---------------------------------------------------------------------------
+
+job_store: dict[str, dict] = {}
+
 
 class ConnectionManager:
     def __init__(self):
@@ -31,29 +151,345 @@ class ConnectionManager:
         self.active_connections.remove(websocket)
 
     async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
+        await asyncio.gather(
+            *[conn.send_text(message) for conn in self.active_connections],
+            return_exceptions=True,
+        )
+
 
 manager = ConnectionManager()
 
+
+# ---------------------------------------------------------------------------
+# State update helpers
+# ---------------------------------------------------------------------------
+
+def _update_job_store(task_id: str, payload: dict) -> None:
+    step = payload.get("step")
+    status = payload.get("status")
+    if step == "INIT" and status == "Running":
+        job_store[task_id]["state"] = "STARTED"
+    elif step == "PIPELINE" and status == "Success":
+        job_store[task_id]["state"] = "SUCCESS"
+    elif step == "PIPELINE" and status == "Failed":
+        job_store[task_id]["state"] = "FAILURE"
+    if "vuln" in payload and payload["vuln"] is not None:
+        job_store[task_id]["vuln"] = payload["vuln"]
+    if "result" in payload and payload["result"] is not None:
+        job_store[task_id]["result"] = payload["result"]
+
+
+def _db_sync_update(task_id: str, payload: dict) -> None:
+    """Persist a pipeline status update to PostgreSQL (called in a thread pool)."""
+    step = payload.get("step")
+    status = payload.get("status")
+    try:
+        db = SessionLocal()
+        job = db.query(Job).filter(Job.task_id == task_id).first()
+        if not job:
+            return
+        if step == "INIT" and status == "Running":
+            job.state = "STARTED"
+        elif step == "PIPELINE" and status == "Success":
+            job.state = "SUCCESS"
+            job.completed_at = datetime.utcnow()
+        elif step == "PIPELINE" and status == "Failed":
+            job.state = "FAILURE"
+            job.completed_at = datetime.utcnow()
+        if payload.get("vuln"):
+            v = payload["vuln"]
+            job.vuln_message = v.get("message")
+            job.vuln_file = v.get("file")
+            job.code_snippet = v.get("code_snippet")
+        if payload.get("result"):
+            r = payload["result"]
+            job.patch_generated = r.get("patch_generated")
+            job.crash_hex = r.get("crash_hex")
+            job.patch_code = r.get("patch_code")
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
+
 @app.on_event("startup")
 async def startup_event():
+    database.init_db()
     url = os.environ.get('CELERY_BROKER_URL', 'redis://redis:6379/0')
     app.state.redis = redis.from_url(url)
     app.state.pubsub = app.state.redis.pubsub()
     await app.state.pubsub.subscribe("pipeline_logs")
     asyncio.create_task(redis_listener())
 
+
 async def redis_listener():
     async for message in app.state.pubsub.listen():
         if message["type"] == "message":
-            await manager.broadcast(message["data"].decode("utf-8"))
+            raw = message["data"].decode("utf-8")
+            try:
+                payload = json.loads(raw)
+                task_id = payload.get("task_id")
+                if task_id and task_id in job_store:
+                    _update_job_store(task_id, payload)
+                    asyncio.get_event_loop().run_in_executor(
+                        None, _db_sync_update, task_id, payload
+                    )
+            except (json.JSONDecodeError, KeyError):
+                pass
+            await manager.broadcast(raw)
+
+
+# ---------------------------------------------------------------------------
+# Public job API (existing contracts — unchanged)
+# ---------------------------------------------------------------------------
 
 @app.post("/api/jobs")
 async def submit_job(job: JobRequest):
-    # Delegate the heavy pipeline to Celery
-    task = run_pipeline.delay(job.repo_url)
-    return {"message": "Job submitted successfully", "task_id": task.id}
+    """
+    POST /api/jobs
+
+    Submit a new repository analysis job.
+
+    Request body:
+        repo_url     (str)           GitHub repository URL to analyse
+        submitted_by (str, optional) User identifier (e.g. email). Stored for
+                                     admin reporting; not used for auth.
+
+    Response:
+        message  (str) Confirmation message
+        task_id  (str) UUID of the queued job
+    """
+    task_id = str(uuid.uuid4())
+    job_store[task_id] = {
+        "task_id": task_id,
+        "state": "PENDING",
+        "repo_url": job.repo_url,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "vuln": None,
+        "result": None,
+    }
+
+    db = SessionLocal()
+    try:
+        db_job = Job(
+            task_id=task_id,
+            repo_url=job.repo_url,
+            submitted_by=job.submitted_by,
+            state="PENDING",
+            submitted_at=datetime.utcnow(),
+        )
+        db.add(db_job)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    run_pipeline.apply_async((job.repo_url,), task_id=task_id)
+    return {"message": "Job submitted successfully", "task_id": task_id}
+
+
+@app.get("/api/jobs", response_model=list[JobSummary])
+async def list_jobs():
+    return [
+        JobSummary(
+            task_id=v["task_id"],
+            state=v["state"],
+            repo_url=v.get("repo_url"),
+            submitted_at=v.get("submitted_at"),
+        )
+        for v in job_store.values()
+    ]
+
+
+@app.get("/api/jobs/{task_id}", response_model=JobStatusResponse)
+async def get_job(task_id: str):
+    if task_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+    entry = job_store[task_id]
+    vuln = VulnFinding(**entry["vuln"]) if entry.get("vuln") else None
+    result = PipelineResult(**entry["result"]) if entry.get("result") else None
+    return JobStatusResponse(
+        task_id=task_id,
+        state=entry["state"],
+        vuln=vuln,
+        result=result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/dashboard", response_model=AdminDashboardResponse)
+def admin_dashboard(db: Session = Depends(get_db)):
+    """
+    GET /admin/dashboard
+
+    Returns aggregate pipeline statistics and the 50 most recent jobs.
+
+    Response:
+        total_jobs  (int)               Total jobs ever submitted
+        pending     (int)               Jobs in PENDING state
+        running     (int)               Jobs in STARTED state
+        succeeded   (int)               Jobs in SUCCESS state
+        failed      (int)               Jobs in FAILURE state
+        recent_jobs (AdminJobSummary[]) Up to 50 most recent jobs, newest first
+    """
+    counts = dict(
+        db.query(Job.state, func.count(Job.id))
+        .group_by(Job.state)
+        .all()
+    )
+    recent = (
+        db.query(Job)
+        .order_by(Job.submitted_at.desc())
+        .limit(50)
+        .all()
+    )
+    return AdminDashboardResponse(
+        total_jobs=sum(counts.values()),
+        pending=counts.get("PENDING", 0),
+        running=counts.get("STARTED", 0),
+        succeeded=counts.get("SUCCESS", 0),
+        failed=counts.get("FAILURE", 0),
+        recent_jobs=[AdminJobSummary.model_validate(j) for j in recent],
+    )
+
+
+@app.get("/admin/dashboard/jobs", response_model=AdminJobsListResponse)
+def admin_list_jobs(
+    page: int = 1,
+    page_size: int = 20,
+    state: str | None = None,
+    submitted_by: str | None = None,
+    repo_url: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    GET /admin/dashboard/jobs
+
+    Returns a paginated, filterable list of all jobs stored in PostgreSQL.
+
+    Query params:
+        page         (int, default=1)    Page number (1-indexed)
+        page_size    (int, default=20)   Results per page (capped at 100)
+        state        (str, optional)     Filter: PENDING | STARTED | SUCCESS | FAILURE
+        submitted_by (str, optional)     Filter by exact submitted_by value
+        repo_url     (str, optional)     Filter by repo_url substring (case-insensitive)
+
+    Response:
+        total     (int)               Total matching records
+        page      (int)               Current page
+        page_size (int)               Items per page
+        items     (AdminJobSummary[]) Matching jobs, newest first
+    """
+    page_size = min(page_size, 100)
+    q = db.query(Job)
+    if state:
+        q = q.filter(Job.state == state)
+    if submitted_by:
+        q = q.filter(Job.submitted_by == submitted_by)
+    if repo_url:
+        q = q.filter(Job.repo_url.ilike(f"%{repo_url}%"))
+
+    total = q.count()
+    jobs = (
+        q.order_by(Job.submitted_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return AdminJobsListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[AdminJobSummary.model_validate(j) for j in jobs],
+    )
+
+
+@app.get("/admin/dashboard/jobs/{task_id}", response_model=AdminJobDetail)
+def admin_get_job(task_id: str, db: Session = Depends(get_db)):
+    """
+    GET /admin/dashboard/jobs/{task_id}
+
+    Returns the full record for a single job, including SAST findings and patch.
+
+    Path params:
+        task_id (str) Job UUID
+
+    Response fields:
+        task_id         (str)       Job UUID
+        repo_url        (str)       Target GitHub repository URL
+        submitted_by    (str|null)  User identifier; null for anonymous submissions
+        state           (str)       PENDING | STARTED | SUCCESS | FAILURE
+        submitted_at    (datetime)  UTC timestamp of submission
+        completed_at    (datetime)  UTC timestamp of pipeline completion, or null
+        vuln_message    (str|null)  Vulnerability description from CodeQL SAST
+        vuln_file       (str|null)  Relative file path of the vulnerability
+        code_snippet    (str|null)  First 500 chars of the vulnerable source code
+        patch_generated (bool|null) True when a patch was successfully generated
+        crash_hex       (str|null)  AFL++ crash input encoded as hexadecimal
+        patch_code      (str|null)  LLM-generated patch source code
+
+    Errors:
+        404  Job not found
+    """
+    job = db.query(Job).filter(Job.task_id == task_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return AdminJobDetail.model_validate(job)
+
+
+@app.get("/admin/dashboard/users", response_model=AdminUsersResponse)
+def admin_list_users(db: Session = Depends(get_db)):
+    """
+    GET /admin/dashboard/users
+
+    Returns per-user job statistics, ordered by most recent activity.
+    Anonymous submissions (submitted_by=null) are grouped together as one entry.
+
+    Response — list of UserStats:
+        submitted_by      (str|null)  User identifier; null = anonymous
+        total_jobs        (int)       Total jobs submitted by this user
+        succeeded         (int)       Jobs that reached SUCCESS state
+        failed            (int)       Jobs that reached FAILURE state
+        last_submitted_at (datetime)  Most recent submission timestamp
+    """
+    rows = (
+        db.query(
+            Job.submitted_by,
+            func.count(Job.id).label("total_jobs"),
+            func.sum(case((Job.state == "SUCCESS", 1), else_=0)).label("succeeded"),
+            func.sum(case((Job.state == "FAILURE", 1), else_=0)).label("failed"),
+            func.max(Job.submitted_at).label("last_submitted_at"),
+        )
+        .group_by(Job.submitted_by)
+        .order_by(func.max(Job.submitted_at).desc())
+        .all()
+    )
+    return AdminUsersResponse(
+        items=[
+            UserStats(
+                submitted_by=r.submitted_by,
+                total_jobs=r.total_jobs,
+                succeeded=r.succeeded or 0,
+                failed=r.failed or 0,
+                last_submitted_at=r.last_submitted_at,
+            )
+            for r in rows
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

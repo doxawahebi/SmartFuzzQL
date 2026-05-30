@@ -5,6 +5,7 @@ celery
 redis
 websockets
 psycopg2-binary
+sqlalchemy
 google-genai
 rich
 docker

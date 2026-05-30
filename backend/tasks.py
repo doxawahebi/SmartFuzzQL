@@ -13,6 +13,7 @@ import docker
 import requests
 import io
 import tarfile
+from datetime import datetime
 
 console = Console()
 redis_client = redis.Redis.from_url(os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
@@ -23,13 +24,17 @@ celery_app = Celery(
     backend=os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
 )
 
-def notify_status(task_id, step, status, details=None):
+def notify_status(task_id, step, status, details=None, extra=None):
     # Rich print for CMD logs
     color = "green" if status == "Success" else "red" if status == "Failed" else "cyan"
     console.print(f"[{color}][{step}][/{color}] {status} - {escape(str(details or ''))}")
-    
+
     # Broadcast to Redis PubSub for WebSockets
-    message = json.dumps({"task_id": task_id, "step": step, "status": status, "details": details})
+    payload = {"task_id": task_id, "step": step, "status": status, "details": details}
+    if extra:
+        _CORE_KEYS = {"task_id", "step", "status", "details"}
+        payload.update({k: v for k, v in extra.items() if k not in _CORE_KEYS})
+    message = json.dumps(payload)
     try:
         redis_client.publish('pipeline_logs', message)
     except Exception as e:
@@ -125,6 +130,18 @@ def run_pipeline(self, repo_url: str):
              with open(vuln_file_full, "r") as f: vuln_code = f.read()
         console.print(f"vuln_code : {vuln_code}")
 
+        notify_status(
+            task_id, "SAST", "Success",
+            f"Found vulnerability: {vuln_msg} in {vuln_file}",
+            extra={
+                "vuln": {
+                    "message": vuln_msg,
+                    "file": vuln_file,
+                    "code_snippet": vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None,
+                }
+            }
+        )
+
         # Step 2: AI Harness Generation
         notify_status(task_id, "AI_HARNESS", "Running", "Requesting source-code level C harness from LLM")
         prompt = f"Write a complete C harness for AFL++ targeting this file: {vuln_file}. Vulnerability: {vuln_msg}\nSource Code:\n```c\n{vuln_code}\n```"
@@ -146,10 +163,11 @@ def run_pipeline(self, repo_url: str):
 
         # Run container
         container = docker_client.containers.run(
-            image_name, 
-            command="tail -f /dev/null", 
-            detach=True, 
-            working_dir="/target"
+            image_name,
+            command="tail -f /dev/null",
+            detach=True,
+            working_dir="/target",
+            privileged=True,
         )
         
         # 409 error : Check if container is running
@@ -213,9 +231,10 @@ def run_pipeline(self, repo_url: str):
         # Setup basic inputs and run afl-fuzz
         container.exec_run("mkdir -p inputs outputs", user="root")
         container.exec_run("sh -c 'echo A > inputs/seed'", user="root")
-        
+        container.exec_run("sh -c 'echo core > /proc/sys/kernel/core_pattern'", user="root")
+
         notify_status(task_id, "DAST", "Running", f"Starting AFL++ fuzzing... This may take up to {TIME_MINITUTE} minutes. Monitoring for crashes.")
-        fuzz_cmd = "afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
+        fuzz_cmd = "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
         container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
         
         # Read the background process logs to verify it started correctly
@@ -238,7 +257,34 @@ def run_pipeline(self, repo_url: str):
             stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
             if stats.exit_code == 0:
                 stats_str = stats.output.decode('utf-8')
-                notify_status(task_id, "DAST", "Running", f"Fuzzer running... Stats:\n{stats_str[:200]}...") # Truncated
+                afl_stats = {}
+                for line in stats_str.splitlines():
+                    if ':' in line:
+                        k, _, v = line.partition(':')
+                        afl_stats[k.strip()] = v.strip()
+                elapsed_sec = 0
+                raw_time = afl_stats.get("run_time", "0")
+                try:
+                    elapsed_sec = int(raw_time.split()[0])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    execs = int(afl_stats.get("execs_done", "0") or "0")
+                    crashes = int(afl_stats.get("unique_crashes", "0") or "0")
+                except ValueError:
+                    execs = 0
+                    crashes = 0
+                notify_status(
+                    task_id, "DAST", "Running",
+                    f"Fuzzer running... Stats:\n{stats_str[:200]}...",
+                    extra={
+                        "fuzz_stats": {
+                            "time_sec": elapsed_sec,
+                            "execs": execs,
+                            "crashes": crashes,
+                        }
+                    }
+                )
             else:
                 # No stats file yet
                 console.print(f"[DEBUG] fuzzer_stats not found yet. Exit code: {stats.exit_code}")
@@ -268,13 +314,65 @@ def run_pipeline(self, repo_url: str):
         
         # Step 5: DB Storage
         notify_status(task_id, "DB_STORAGE", "Running", "Storing vulnerability, harness, fuzzer trace, and patches in PostgreSQL")
-        # TODO: PostgreSQL insert operations. We assume the frontend handles DB read via other endpoints for now.
-        
-        notify_status(task_id, "PIPELINE", "Success", "Pipeline completely executed.")
+        try:
+            from database import SessionLocal
+            from models import Job as JobModel
+            db = SessionLocal()
+            try:
+                job_row = db.query(JobModel).filter(JobModel.task_id == task_id).first()
+                if job_row:
+                    job_row.state = "SUCCESS"
+                    job_row.completed_at = datetime.utcnow()
+                    job_row.vuln_message = vuln_msg
+                    job_row.vuln_file = vuln_file
+                    job_row.code_snippet = vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None
+                    job_row.patch_generated = True
+                    job_row.crash_hex = crash_data.hex() if crash_data else None
+                    job_row.patch_code = patch_code
+                    db.commit()
+                notify_status(task_id, "DB_STORAGE", "Success", "Results stored in PostgreSQL")
+            except Exception as db_err:
+                db.rollback()
+                notify_status(task_id, "DB_STORAGE", "Warning", f"DB write failed: {db_err}")
+            finally:
+                db.close()
+        except ImportError:
+            notify_status(task_id, "DB_STORAGE", "Warning", "Database module unavailable, skipping storage")
+
+        notify_status(
+            task_id, "PIPELINE", "Success",
+            "Pipeline completely executed.",
+            extra={
+                "result": {
+                    "repo": repo_url,
+                    "vuln_msg": vuln_msg,
+                    "vuln_file": vuln_file,
+                    "patch_generated": True,
+                    "crash_hex": crash_data.hex() if crash_data else None,
+                    "patch_code": patch_code,
+                }
+            }
+        )
         return {"status": "Complete", "repo": repo_url, "patch_generated": True}
         
     except Exception as e:
         notify_status(task_id, "PIPELINE", "Failed", str(e))
+        try:
+            from database import SessionLocal
+            from models import Job as JobModel
+            db = SessionLocal()
+            try:
+                job_row = db.query(JobModel).filter(JobModel.task_id == task_id).first()
+                if job_row:
+                    job_row.state = "FAILURE"
+                    job_row.completed_at = datetime.utcnow()
+                    db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+        except ImportError:
+            pass
         raise e
     finally:
         # Cleanup

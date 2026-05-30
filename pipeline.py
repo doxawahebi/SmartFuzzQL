@@ -67,7 +67,7 @@ def step_1_setup_environment():
     run_cmd(f"docker rm -f {CONTAINER_NAME}", check=False)
     
     # Start container with volume attached
-    run_cmd(f"docker run -d --name {CONTAINER_NAME} -v {WORKSPACE_DIR}:/workspace -w /workspace {DOCKER_IMAGE} tail -f /dev/null")
+    run_cmd(f"docker run -d --privileged --name {CONTAINER_NAME} -v {WORKSPACE_DIR}:/workspace -w /workspace {DOCKER_IMAGE} tail -f /dev/null")
 
 def step_2_static_analysis(repo_dir):
     print("[+] Step 2: Creating CodeQL Database...")
@@ -212,7 +212,8 @@ Output ONLY the C code, inside a ```c block.
         run_cmd(f"docker exec {CONTAINER_NAME} rm -rf inputs outputs", check=False)
         run_cmd(f"docker exec {CONTAINER_NAME} mkdir -p inputs")
         run_cmd(f"docker exec {CONTAINER_NAME} sh -c 'echo \"A\" > inputs/seed'")
-        
+        run_cmd(f"docker exec {CONTAINER_NAME} sh -c 'echo core > /proc/sys/kernel/core_pattern'")
+
         # Run fuzzer in background.
         fuzz_cmd = f"docker exec -e AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 -e AFL_SKIP_CPUFREQ=1 {CONTAINER_NAME} afl-fuzz -i inputs -o outputs -- ./{FUZZ_TARGET}"
         proc = subprocess.Popen(fuzz_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

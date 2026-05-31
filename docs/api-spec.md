@@ -220,3 +220,222 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
 The Project Dashboard (`/dashboard`) consumes **only the shared `/ws` transport** for real-time updates — it does not open a second WebSocket or poll the REST endpoints during a live run. The REST endpoints (`GET /api/jobs`, `GET /api/jobs/{task_id}`) are available for page-load hydration or job history display.
 
 **Visualization library:** `recharts ^2.12.0` — `LineChart` for `fuzz_stats` (execs/crashes over time). Vulnerability details are rendered as Tailwind cards.
+
+---
+
+## Report Endpoint
+
+### GET /api/jobs/{task_id}/report
+
+Returns the full vulnerability report for a completed job, including the SARIF taint-flow graph and the original-vs-patch diff.
+
+**Path parameter:** `task_id` — UUID returned from `POST /api/jobs`
+
+**Response 200** — `ReportResponse`
+```json
+{
+  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "repo_url": "https://github.com/example/vulnerable-repo",
+  "state": "SUCCESS",
+  "vuln_summary": {
+    "message": "Potential buffer overflow via strcpy",
+    "file": "src/main.c",
+    "rule_id": null
+  },
+  "taint_path": {
+    "nodes": [
+      { "id": "n0", "label": "input", "role": "source", "file": "src/main.c", "start_line": 5, "start_col": 1, "end_col": 10 },
+      { "id": "n1", "label": "strcpy(buf, input)", "role": "sink", "file": "src/main.c", "start_line": 7, "start_col": 3, "end_col": 22 }
+    ],
+    "edges": [
+      { "id": "e0", "source": "n0", "target": "n1" }
+    ]
+  },
+  "diff": {
+    "original": "void f(char* input) { char buf[10]; strcpy(buf, input); }",
+    "patched":  "void f(char* input) { char buf[10]; strncpy(buf, input, 9); buf[9] = '\\0'; }",
+    "language": "c"
+  },
+  "crash": { "hex": "4141414141414141414141" }
+}
+```
+
+**Response 404** — job not found  
+**Response 409** — job not yet complete; response header `X-Job-State` carries the current state (`PENDING | STARTED | FAILURE`)
+
+---
+
+## Admin Endpoints
+
+All admin endpoints read from PostgreSQL and reflect persisted state. They are independent of the in-memory `job_store` used by the real-time WebSocket layer.
+
+---
+
+### GET /admin/dashboard
+
+Returns aggregate pipeline statistics and the 50 most recent jobs.
+
+**Response 200** — `AdminDashboardResponse`
+```json
+{
+  "total_jobs": 142,
+  "pending":    3,
+  "running":    1,
+  "succeeded":  130,
+  "failed":     8,
+  "recent_jobs": [
+    {
+      "task_id":         "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "repo_url":        "https://github.com/example/repo",
+      "submitted_by":    "user@example.com",
+      "state":           "SUCCESS",
+      "submitted_at":    "2026-05-31T12:00:00+00:00",
+      "completed_at":    "2026-05-31T12:04:30+00:00",
+      "patch_generated": true
+    }
+  ]
+}
+```
+
+`recent_jobs` contains up to 50 entries, newest first. `submitted_by` is `null` for anonymous submissions.
+
+---
+
+### GET /admin/dashboard/jobs
+
+Returns a paginated, filterable list of all jobs stored in PostgreSQL.
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | int | 1 | Page number (1-indexed) |
+| `page_size` | int | 20 | Results per page (max 100) |
+| `state` | string | — | Filter: `PENDING \| STARTED \| SUCCESS \| FAILURE` |
+| `submitted_by` | string | — | Exact match on submitter identifier |
+| `repo_url` | string | — | Case-insensitive substring match on repository URL |
+
+**Response 200** — `AdminJobsListResponse`
+```json
+{
+  "total":     142,
+  "page":      1,
+  "page_size": 20,
+  "items": [ /* AdminJobSummary[] — same shape as recent_jobs above */ ]
+}
+```
+
+---
+
+### GET /admin/dashboard/jobs/{task_id}
+
+Returns the full record for a single job, including the vulnerability finding and generated patch.
+
+**Path parameter:** `task_id` — job UUID
+
+**Response 200** — `AdminJobDetail`
+```json
+{
+  "task_id":         "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "repo_url":        "https://github.com/example/repo",
+  "submitted_by":    "user@example.com",
+  "state":           "SUCCESS",
+  "submitted_at":    "2026-05-31T12:00:00+00:00",
+  "completed_at":    "2026-05-31T12:04:30+00:00",
+  "vuln_message":    "Potential buffer overflow via strcpy",
+  "vuln_file":       "src/main.c",
+  "code_snippet":    "void vulnerable_func(char* input) { ... }",
+  "patch_generated": true,
+  "crash_hex":       "4141414141414141414141",
+  "patch_code":      "void vulnerable_func(char* input) { ... }"
+}
+```
+
+`vuln_message`, `vuln_file`, `code_snippet`, `patch_generated`, `crash_hex`, and `patch_code` are `null` until the corresponding pipeline steps complete.
+
+**Response 404** — job not found
+
+---
+
+### GET /admin/dashboard/users
+
+Returns per-user job statistics, ordered by most recent activity. Anonymous submissions (`submitted_by = null`) are grouped as a single entry.
+
+**Response 200** — `AdminUsersResponse`
+```json
+{
+  "items": [
+    {
+      "submitted_by":      "user@example.com",
+      "total_jobs":        25,
+      "succeeded":         22,
+      "failed":            3,
+      "last_submitted_at": "2026-05-31T12:00:00+00:00"
+    },
+    {
+      "submitted_by":      null,
+      "total_jobs":        12,
+      "succeeded":         10,
+      "failed":            2,
+      "last_submitted_at": "2026-05-30T09:15:00+00:00"
+    }
+  ]
+}
+```
+
+---
+
+## Admin Data Schemas
+
+### AdminJobSummary
+```json
+{
+  "task_id":         "string",
+  "repo_url":        "string",
+  "submitted_by":    "string | null",
+  "state":           "PENDING | STARTED | SUCCESS | FAILURE",
+  "submitted_at":    "ISO-8601 UTC datetime",
+  "completed_at":    "ISO-8601 UTC datetime | null",
+  "patch_generated": "boolean | null"
+}
+```
+
+### AdminJobDetail
+All fields from `AdminJobSummary`, plus:
+```json
+{
+  "vuln_message":    "string | null",
+  "vuln_file":       "string | null",
+  "code_snippet":    "string | null",
+  "crash_hex":       "string | null",
+  "patch_code":      "string | null"
+}
+```
+
+### UserStats
+```json
+{
+  "submitted_by":      "string | null",
+  "total_jobs":        "integer",
+  "succeeded":         "integer",
+  "failed":            "integer",
+  "last_submitted_at": "ISO-8601 UTC datetime"
+}
+```
+
+### ReportResponse
+```json
+{
+  "task_id":     "string",
+  "repo_url":    "string",
+  "state":       "string",
+  "vuln_summary": { "message": "string|null", "file": "string|null", "rule_id": "string|null" },
+  "taint_path":  { "nodes": "TaintNode[]", "edges": "TaintEdge[]" },
+  "diff":        { "original": "string", "patched": "string", "language": "string" },
+  "crash":       { "hex": "string | null" }
+}
+```
+
+**TaintNode:** `{ id, label, role, file, start_line, start_col, end_col }`  
+**TaintEdge:** `{ id, source, target }`  
+`diff.language` is inferred from `vuln_file` extension: `c`, `cpp`, or `plaintext`.

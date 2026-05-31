@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
+import Breadcrumb from './Breadcrumb.jsx';
 import ReactFlow, { Background, Controls, MarkerType } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { DiffEditor } from '@monaco-editor/react';
@@ -95,7 +96,7 @@ const ReportViewer = () => {
         <div className="text-center">
           <p className="text-xl mb-2">Failed to load report</p>
           <p className="text-sm text-gray-400 mb-4">{error}</p>
-          <Link to="/" className="text-blue-400 hover:underline">← Back to Dashboard</Link>
+          <Link to="/dashboard" className="text-blue-400 hover:underline">← Back to Dashboard</Link>
         </div>
       </div>
     );
@@ -106,7 +107,7 @@ const ReportViewer = () => {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 bg-gray-800 border-b border-gray-700 shrink-0">
         <div>
-          <Link to="/" className="text-blue-400 hover:underline text-sm">← Dashboard</Link>
+          <Breadcrumb />
           <h1 className="text-xl font-bold mt-0.5">Vulnerability Report</h1>
         </div>
         <div className="text-right text-sm text-gray-400">

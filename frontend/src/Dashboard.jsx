@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
+import Breadcrumb from './Breadcrumb.jsx';
 import ReactFlow, { Background, Controls } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
@@ -43,61 +44,87 @@ const Dashboard = () => {
   };
 
   const logsEndRef = React.useRef(null);
+  const wsRef = React.useRef(null);
+  const taskIdRef = React.useRef(null);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   useEffect(() => {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = window.location.hostname;
-    const wsUrl = `${wsProtocol}//${wsHost}:8000/ws`;
-    const ws = new WebSocket(wsUrl);
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        const logLine = `[${data.step}] ${data.status} - ${data.details}`;
-        setLogs((prev) => [...prev, logLine]);
+    let reconnectTimer = null;
 
-        const nodeId = nodeMap[data.step];
-        if (nodeId) {
-          setNodes((nds) => nds.map((node) => {
-            if (node.id === nodeId) {
-              const ringColor = data.status === 'Running' ? '#60a5fa' : data.status === 'Success' ? '#10b981' : data.status === 'Failed' ? '#ef4444' : '#374151';
-              return {
-                ...node,
-                style: {
-                  background: '#1f2937',
-                  color: 'white',
-                  border: `2px solid ${ringColor}`,
-                  boxShadow: data.status === 'Running' ? `0 0 15px ${ringColor}` : 'none',
-                  borderRadius: '5px',
-                  padding: '10px'
-                }
-              };
-            }
-            return node;
-          }));
-        }
+    const connectWs = () => {
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${wsProtocol}//${window.location.hostname}:8000/ws`);
+      wsRef.current = ws;
 
-        if (data.vuln) {
-          setVulnData(data.vuln);
-        }
+      ws.onopen = () => {
+        setLogs((prev) => [...prev, '[WS] Connected to pipeline server.']);
+      };
 
-        if (data.result) {
-          setPipelineResult(data.result);
-        }
+      ws.onerror = () => {
+        setLogs((prev) => [...prev, '[WS] Connection error — retrying in 3 s...']);
+      };
 
-        if (data.step === "DAST" && data.fuzz_stats) {
-          const { time_sec, execs, crashes } = data.fuzz_stats;
-          const minutes = Math.floor(time_sec / 60);
-          setFuzzStats((prev) => [...prev, { time: `${minutes}m`, execs, crashes }]);
+      ws.onclose = () => {
+        reconnectTimer = setTimeout(connectWs, 3000);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (taskIdRef.current && data.task_id !== taskIdRef.current) return;
+
+          const logLine = `[${data.step}] ${data.status} - ${data.details}`;
+          setLogs((prev) => [...prev, logLine]);
+
+          const nodeId = nodeMap[data.step];
+          if (nodeId) {
+            setNodes((nds) => nds.map((node) => {
+              if (node.id === nodeId) {
+                const ringColor = data.status === 'Running' ? '#60a5fa' : data.status === 'Success' ? '#10b981' : data.status === 'Failed' ? '#ef4444' : '#374151';
+                return {
+                  ...node,
+                  style: {
+                    background: '#1f2937',
+                    color: 'white',
+                    border: `2px solid ${ringColor}`,
+                    boxShadow: data.status === 'Running' ? `0 0 15px ${ringColor}` : 'none',
+                    borderRadius: '5px',
+                    padding: '10px'
+                  }
+                };
+              }
+              return node;
+            }));
+          }
+
+          if ('vuln' in data) {
+            setVulnData(data.vuln);
+          }
+
+          if ('result' in data) {
+            setPipelineResult(data.result);
+          }
+
+          if (data.step === "DAST" && 'fuzz_stats' in data) {
+            const { time_sec, execs, crashes } = data.fuzz_stats;
+            const minutes = Math.floor(time_sec / 60);
+            setFuzzStats((prev) => [...prev, { time: `${minutes}m`, execs, crashes }]);
+          }
+        } catch (err) {
+          setLogs((prev) => [...prev, event.data]);
         }
-      } catch (err) {
-        setLogs((prev) => [...prev, event.data]);
-      }
+      };
     };
-    return () => ws.close();
+
+    connectWs();
+
+    return () => {
+      clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
   }, []);
 
   const handleStartPipeline = async () => {
@@ -105,6 +132,7 @@ const Dashboard = () => {
     setPipelineResult(null);
     setFuzzStats([]);
     setTaskId(null);
+    taskIdRef.current = null;
     try {
       const apiHost = window.location.hostname;
       const apiUrl = `${window.location.protocol}//${apiHost}:8000/api/jobs`;
@@ -113,17 +141,33 @@ const Dashboard = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_url: repoUrl })
       });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        setLogs((prev) => [...prev, `[ERROR] Job submission failed: ${errBody.detail ?? res.status}`]);
+        return;
+      }
       const data = await res.json();
+      if (!data.task_id) {
+        setLogs((prev) => [...prev, '[ERROR] No task_id in server response.']);
+        return;
+      }
+      taskIdRef.current = data.task_id;
       setTaskId(data.task_id);
       setLogs((prev) => [...prev, `Job submitted: ${data.task_id}`]);
     } catch (err) {
-      console.error(err);
+      setLogs((prev) => [...prev, `[ERROR] Network error: ${err.message}`]);
     }
   };
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white p-4 font-sans">
-      <h1 className="text-3xl font-bold mb-4">HAST Full-Stack Dashboard</h1>
+      <div className="flex items-center justify-between">
+        <Breadcrumb />
+        <Link to="/admin/dashboard" className="text-xs text-gray-400 hover:text-blue-400 transition-colors">
+          Admin →
+        </Link>
+      </div>
+      <h1 className="text-3xl font-bold mb-4 mt-1">HAST Full-Stack Dashboard</h1>
 
       <div className="mb-4 flex space-x-2">
         <input

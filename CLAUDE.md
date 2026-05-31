@@ -150,6 +150,20 @@ Both `pipeline.py` and `backend/tasks.py` call Gemini via `google-genai`. The mo
 - Refactoring: Do not break existing `/api/jobs` or `/ws` contracts without explicit permission.
 - Conflict Resolution: If performance and readability conflict, prioritize readability.
 
+## Documentation
+
+Detailed reference documents live in `docs/`. Always consult these before adding or changing API or WebSocket behaviour:
+
+| Document | Covers |
+|----------|--------|
+| `docs/api-spec.md` | All REST and admin endpoint contracts, schemas, error codes |
+| `docs/websocket.md` | WebSocket event schema, step lifecycle, backend and frontend integration |
+
+Sub-CLAUDE.md files with per-directory guidance:
+
+- `backend/CLAUDE.md` — backend rules, API contract rules, WebSocket publish path
+- `frontend/CLAUDE.md` — frontend rules, WebSocket client pattern, component conventions
+
 ## Deep Dive References
 
 - Standalone pipeline flow: `pipeline.py`

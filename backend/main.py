@@ -350,7 +350,10 @@ async def submit_job(job: JobRequest):
     finally:
         db.close()
 
-    run_pipeline.apply_async((job.repo_url,), task_id=task_id)
+    try:
+        run_pipeline.apply_async((job.repo_url,), task_id=task_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Celery broker unavailable: {exc}")
     return {"message": "Job submitted successfully", "task_id": task_id}
 
 

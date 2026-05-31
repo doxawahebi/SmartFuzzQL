@@ -157,6 +157,13 @@ class TaintPath(BaseModel):
     edges: list[TaintEdge]
 
 
+class CallPath(BaseModel):
+    """Reachability chain main -> ... -> vulnerable function (same node/edge shape
+    as TaintPath; roles map source=entry, intermediate=caller, sink=vulnerable fn)."""
+    nodes: list[TaintNode]
+    edges: list[TaintEdge]
+
+
 class DiffPayload(BaseModel):
     original: str
     patched: str
@@ -179,6 +186,7 @@ class ReportResponse(BaseModel):
     state: str
     vuln_summary: VulnSummary
     taint_path: TaintPath
+    call_path: CallPath
     diff: DiffPayload
     crash: CrashInfo
 
@@ -548,6 +556,7 @@ def get_report(task_id: str, db: Session = Depends(get_db)):
             "cxx": "cpp", "hpp": "cpp"}.get(ext, "plaintext")
 
     raw_path = job.taint_path or {"nodes": [], "edges": []}
+    raw_call = job.call_path or {"nodes": [], "edges": []}
     return ReportResponse(
         task_id=job.task_id,
         repo_url=job.repo_url,
@@ -560,6 +569,10 @@ def get_report(task_id: str, db: Session = Depends(get_db)):
         taint_path=TaintPath(
             nodes=[TaintNode(**n) for n in raw_path.get("nodes", [])],
             edges=[TaintEdge(**e) for e in raw_path.get("edges", [])],
+        ),
+        call_path=CallPath(
+            nodes=[TaintNode(**n) for n in raw_call.get("nodes", [])],
+            edges=[TaintEdge(**e) for e in raw_call.get("edges", [])],
         ),
         diff=DiffPayload(
             original=job.original_code or job.code_snippet or "",

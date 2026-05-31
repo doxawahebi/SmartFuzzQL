@@ -23,7 +23,7 @@ def init_db() -> None:
     import models  # noqa: F401 — registers Job model with Base
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
-        for col, typedef in [("original_code", "TEXT"), ("taint_path", "JSONB")]:
+        for col, typedef in [("original_code", "TEXT"), ("taint_path", "JSONB"), ("call_path", "JSONB")]:
             conn.execute(text(
                 f"ALTER TABLE jobs ADD COLUMN IF NOT EXISTS {col} {typedef}"
             ))

@@ -23,3 +23,4 @@ class Job(Base):
     patch_code      = Column(Text, nullable=True)
     original_code   = Column(Text, nullable=True)
     taint_path      = Column(JSON, nullable=True)
+    call_path       = Column(JSON, nullable=True)

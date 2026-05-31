@@ -1,4 +1,5 @@
 from celery import Celery
+import collections
 import time
 import tempfile
 import shutil
@@ -84,6 +85,127 @@ def _extract_taint_path(sarif_result: dict) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# Dangerous C string sinks (kept in sync with backend/queries/*.ql DangerousFunction).
+DANGEROUS_FUNCS = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf"}
+CALL_EDGE_RULE_ID = "cpp/call-graph-edges"
+
+
+def _parse_call_edges(sarif_results: list) -> tuple:
+    """Parse call_graph.ql results into (edges, locs).
+
+    edges: list of (caller, callee) tuples.
+    locs:  dict mapping (caller, callee) -> (file_uri, start_line) of the call site.
+    """
+    edges, locs = [], {}
+    for r in sarif_results:
+        if r.get("ruleId") != CALL_EDGE_RULE_ID:
+            continue
+        text = r.get("message", {}).get("text", "")
+        if not text.startswith("CALL_EDGE ") or " -> " not in text:
+            continue
+        caller, callee = text[len("CALL_EDGE "):].split(" -> ", 1)
+        caller, callee = caller.strip(), callee.strip()
+        phys = (r.get("locations", [{}])[0] or {}).get("physicalLocation", {})
+        file = phys.get("artifactLocation", {}).get("uri", "")
+        line = phys.get("region", {}).get("startLine", 0)
+        edges.append((caller, callee))
+        locs[(caller, callee)] = (file, line)
+    return edges, locs
+
+
+def _vuln_fn_from_related(vuln_result: dict, callers: set) -> str | None:
+    """Best-effort: pull a function name from a finding's relatedLocations that is a
+    known caller in the call graph (covers structural queries like bootp_print.ql)."""
+    for rel in vuln_result.get("relatedLocations", []) if vuln_result else []:
+        name = rel.get("message", {}).get("text", "").strip()
+        if name in callers:
+            return name
+    return None
+
+
+def _find_vuln_function(edges: list, locs: dict, sink_line: int, vuln_result: dict | None) -> str | None:
+    """Identify the function enclosing the sink: the internal function that calls a
+    dangerous C function, preferring the call site on the taint sink's line."""
+    dangerous_edges = [(caller, callee) for (caller, callee) in edges if callee in DANGEROUS_FUNCS]
+    if dangerous_edges:
+        if sink_line:
+            for caller, callee in dangerous_edges:
+                if locs.get((caller, callee), ("", 0))[1] == sink_line:
+                    return caller
+        return dangerous_edges[0][0]
+    # Fallback for structural findings without a dangerous-call sink.
+    all_fns = {c for c, _ in edges} | {c for _, c in edges}
+    return _vuln_fn_from_related(vuln_result, all_fns)
+
+
+def _call_path_from_chain(chain: list, locs: dict) -> dict:
+    """Build {nodes, edges} (taint_path shape) from an ordered list of function names."""
+    nodes, out_edges = [], []
+    n = len(chain)
+    for i, fn in enumerate(chain):
+        if i > 0:
+            file, line = locs.get((chain[i - 1], fn), ("", 0))
+        elif n > 1:
+            file, line = locs.get((chain[0], chain[1]), ("", 0))
+        else:
+            file, line = "", 0
+        if n == 1:
+            role = "sink"
+        else:
+            role = "source" if i == 0 else ("sink" if i == n - 1 else "intermediate")
+        nodes.append({
+            "id": f"call-{i}",
+            "label": fn,
+            "role": role,
+            "file": file,
+            "start_line": line,
+            "start_col": 0,
+            "end_col": 0,
+        })
+        if i > 0:
+            out_edges.append({"id": f"call-edge-{i-1}-{i}", "source": f"call-{i-1}", "target": f"call-{i}"})
+    return {"nodes": nodes, "edges": out_edges}
+
+
+def _extract_call_path(
+    sarif_results: list,
+    vuln_result: dict | None = None,
+    sink_line: int = 0,
+    entry: str = "main",
+) -> dict:
+    """BFS the static call graph from `entry` (default main) to the vulnerable function,
+    returning the shortest call chain as {nodes, edges} for the report API."""
+    edges, locs = _parse_call_edges(sarif_results)
+    if not edges:
+        return {"nodes": [], "edges": []}
+    vuln_fn = _find_vuln_function(edges, locs, sink_line, vuln_result)
+    if not vuln_fn:
+        return {"nodes": [], "edges": []}
+
+    adj = {}
+    for caller, callee in edges:
+        adj.setdefault(caller, []).append(callee)
+
+    # BFS for the shortest entry -> vuln_fn chain.
+    chain = None
+    if entry in adj or entry == vuln_fn:
+        queue = collections.deque([[entry]])
+        seen = {entry}
+        while queue:
+            path = queue.popleft()
+            if path[-1] == vuln_fn:
+                chain = path
+                break
+            for nxt in adj.get(path[-1], []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(path + [nxt])
+    # If the entry can't reach the sink (or there is no entry), show the vuln fn alone.
+    if chain is None:
+        chain = [vuln_fn]
+    return _call_path_from_chain(chain, locs)
+
+
 @celery_app.task(bind=True)
 def run_pipeline(self, repo_url: str):
     task_id = self.request.id
@@ -101,11 +223,17 @@ def run_pipeline(self, repo_url: str):
         notify_status(task_id, "SAST", "Running", "Cloning and extracting source-level logical vulnerabilities via CodeQL")
         db_path = os.path.join(temp_dir, "my-db")
         sarif_path = os.path.join(temp_dir, "results.sarif")
-        
+        callgraph_sarif_path = os.path.join(temp_dir, "callgraph.sarif")
+
         # For this prototype we assume codeql is locally installed and available via CLI, or use a prebuilt container
-        # Since codeql is large, relying on local setup or a specific pipeline config. 
+        # Since codeql is large, relying on local setup or a specific pipeline config.
         # Fallback: if codeql missing, mock the SARIF finding for demonstration of full flow.
-        custom_ql = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom.ql")
+        queries_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
+        # Vulnerability-finding queries and the call-graph query live in separate
+        # subdirectories of the same pack so each CodeQL pass runs only its own queries.
+        vuln_queries_dir = os.path.join(queries_dir, "vulnerabilities")
+        callgraph_queries_dir = os.path.join(queries_dir, "callgraph")
+
         def run_codeql_streaming(cmd):
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in proc.stdout:
@@ -117,33 +245,88 @@ def run_pipeline(self, repo_url: str):
                 raise subprocess.CalledProcessError(proc.returncode, cmd)
         try:
            run_codeql_streaming(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--build-mode=none"])
-           run_codeql_streaming(["codeql", "database", "analyze", db_path, custom_ql, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
+           # Resolve query dependencies (codeql/cpp-all powers the DataFlow taint query).
+           # Best-effort: if the worker is offline but the lib pack is already on the
+           # search path, the analyze step below still succeeds.
+           try:
+               run_codeql_streaming(["codeql", "pack", "install", queries_dir])
+           except subprocess.CalledProcessError as e:
+               notify_status(task_id, "SAST", "Warning", f"codeql pack install failed; relying on --search-path: {e}")
+           # Pass 1 — vulnerability-finding queries only (taint + structural).
+           run_codeql_streaming(["codeql", "database", "analyze", db_path, vuln_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
         except FileNotFoundError:
            notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found. Mocking SARIF for fuzzing step.")
-           mock_sarif = {
-               "runs": [
-                   {"results": [
-                       {
-                           "message": {"text": "Potential buffer overflow"},
-                           "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/main.c"}}}]
-                       }
-                   ]}
-               ]
-           }
-           with open(sarif_path, "w") as f: json.dump(mock_sarif, f)
+           uri = "src/main.c"
+           def _phys(line, col=1, endcol=1):
+               return {"physicalLocation": {"artifactLocation": {"uri": uri},
+                                            "region": {"startLine": line, "startColumn": col, "endColumn": endcol}}}
+           # Vulnerability SARIF (pass 1): a taint finding with a source -> sink path.
+           vuln_mock = {"runs": [{"results": [
+               {
+                   "ruleId": "cpp/taint-buffer-overflow",
+                   "message": {"text": "Potential buffer overflow"},
+                   "locations": [_phys(4, 5, 23)],
+                   "codeFlows": [{"threadFlows": [{"locations": [
+                       {"location": {"message": {"text": "input"}, **_phys(2, 30, 35)}},
+                       {"location": {"message": {"text": "strcpy(buf, input)"}, **_phys(4, 5, 23)}},
+                   ]}]}],
+               },
+           ]}]}
+           # Call-graph SARIF (pass 2): edges consumed by _extract_call_path.
+           callgraph_mock = {"runs": [{"results": [
+               {"ruleId": CALL_EDGE_RULE_ID,
+                "message": {"text": "CALL_EDGE main -> vulnerable_func"},
+                "locations": [_phys(7)]},
+               {"ruleId": CALL_EDGE_RULE_ID,
+                "message": {"text": "CALL_EDGE vulnerable_func -> strcpy"},
+                "locations": [_phys(4)]},
+           ]}]}
+           with open(sarif_path, "w") as f: json.dump(vuln_mock, f)
+           with open(callgraph_sarif_path, "w") as f: json.dump(callgraph_mock, f)
            # Create a dummy src/main.c if it doesn't exist
            os.makedirs(os.path.join(repo_path, "src"), exist_ok=True)
            dummy_c = os.path.join(repo_path, "src", "main.c")
            if not os.path.exists(dummy_c):
-               with open(dummy_c, "w") as f: f.write("void vulnerable_func(char* input) { char buf[10]; strcpy(buf, input); }")
+               with open(dummy_c, "w") as f:
+                   f.write(
+                       "#include <string.h>\n"
+                       "void vulnerable_func(char *input) {\n"
+                       "    char buf[10];\n"
+                       "    strcpy(buf, input);\n"
+                       "}\n"
+                       "int main(int argc, char **argv) {\n"
+                       "    if (argc > 1) vulnerable_func(argv[1]);\n"
+                       "    return 0;\n"
+                       "}\n"
+                   )
+
+        # Pass 2 — call-graph reachability. Supplementary: a failure here must not
+        # abort the pipeline, so it runs outside the vuln pass and swallows errors.
+        try:
+            run_codeql_streaming(["codeql", "database", "analyze", db_path, callgraph_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={callgraph_sarif_path}"])
+        except FileNotFoundError:
+            pass  # CodeQL absent — callgraph.sarif was already mocked above.
+        except Exception as e:
+            notify_status(task_id, "SAST", "Warning", f"Call-graph analysis skipped: {e}")
 
         with open(sarif_path, "r") as f:
             sarif_data = json.load(f)
-            
+
+        # Load call-graph edges from the separate pass (best-effort; may be absent).
+        call_edge_results = []
+        if os.path.exists(callgraph_sarif_path):
+            try:
+                with open(callgraph_sarif_path, "r") as f:
+                    call_edge_results = json.load(f).get("runs", [{}])[0].get("results", [])
+            except (json.JSONDecodeError, OSError) as e:
+                notify_status(task_id, "SAST", "Warning", f"Could not read call-graph SARIF: {e}")
+
         vuln_msg = "Unknown vulnerability"
         vuln_file = "unknown"
-        # TODO : Does this code get the data from sarif correctly?
-        results = sarif_data.get("runs", [{}])[0].get("results", [])
+        all_results = sarif_data.get("runs", [{}])[0].get("results", [])
+        # The vuln pass no longer emits call edges, but filter defensively in case the
+        # pack layout changes and both query sets land in one SARIF.
+        results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
         console.print(f"results : {results}")
         if results:
             vuln_msg = results[0].get("message", {}).get("text", "")
@@ -212,7 +395,7 @@ def run_pipeline(self, repo_url: str):
         copy_text_to_container(container, "/target", "harness.c", harness_code)
         
         # Compile harness with feedback loop
-        compile_cmd = "afl-clang-fast -I/usr/local/include/afl++ -o fuzz_target harness.c"
+        compile_cmd = "afl-clang-fast -fsanitize=fuzzer,address -I/usr/local/include/afl++ -o fuzz_target harness.c"
         max_compile_retries = 3
         compile_success = False
 
@@ -358,7 +541,14 @@ def run_pipeline(self, repo_url: str):
                     job_row.vuln_file = vuln_file
                     job_row.code_snippet = vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None
                     job_row.original_code = vuln_code if vuln_code != "Code not found 243234234234234234" else None
-                    job_row.taint_path = _extract_taint_path(results[0]) if results else {"nodes": [], "edges": []}
+                    # Prefer the finding that carries a data-flow path (codeFlows).
+                    taint_result = next((r for r in results if r.get("codeFlows")), results[0] if results else None)
+                    taint_path = _extract_taint_path(taint_result) if taint_result else {"nodes": [], "edges": []}
+                    sink_line = taint_path["nodes"][-1]["start_line"] if taint_path["nodes"] else 0
+                    job_row.taint_path = taint_path
+                    job_row.call_path = _extract_call_path(
+                        call_edge_results, vuln_result=taint_result, sink_line=sink_line
+                    )
                     job_row.patch_generated = True
                     job_row.crash_hex = crash_data.hex() if crash_data else None
                     job_row.patch_code = patch_code
@@ -464,7 +654,10 @@ def call_llm_api(prompt, model='gemini-2.5-flash', task_type=None):
             model=model,
             contents=prompt,
         )
-        return response.text
+        text = response.text
+        if text is None:
+            return "ERROR: LLM returned empty response (possibly blocked by safety filters)"
+        return text
     except Exception as e:
         return f"ERROR: {e}"
 

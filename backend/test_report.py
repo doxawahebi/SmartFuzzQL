@@ -64,6 +64,13 @@ def test_report_success(client):
             ],
             "edges": [{"id": "edge-0-1", "source": "node-0", "target": "node-1"}],
         },
+        call_path={
+            "nodes": [
+                {"id": "call-0", "label": "main", "role": "source", "file": "src/vuln.c", "start_line": 9, "start_col": 0, "end_col": 0},
+                {"id": "call-1", "label": "f", "role": "sink", "file": "src/vuln.c", "start_line": 9, "start_col": 0, "end_col": 0},
+            ],
+            "edges": [{"id": "call-edge-0-1", "source": "call-0", "target": "call-1"}],
+        },
     )
     db.close()
 
@@ -73,6 +80,9 @@ def test_report_success(client):
     assert body["state"] == "SUCCESS"
     assert body["taint_path"]["nodes"][0]["role"] == "source"
     assert body["taint_path"]["nodes"][1]["role"] == "sink"
+    assert body["call_path"]["nodes"][0]["label"] == "main"
+    assert body["call_path"]["nodes"][0]["role"] == "source"
+    assert body["call_path"]["nodes"][-1]["role"] == "sink"
     assert body["diff"]["language"] == "c"
     assert body["diff"]["original"].startswith("void f")
     assert body["crash"]["hex"] == "deadbeef"
@@ -114,3 +124,5 @@ def test_report_empty_taint_path(client):
     body = r.json()
     assert body["taint_path"]["nodes"] == []
     assert body["taint_path"]["edges"] == []
+    assert body["call_path"]["nodes"] == []
+    assert body["call_path"]["edges"] == []

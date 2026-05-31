@@ -34,6 +34,7 @@ const ReportViewer = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selectedLine, setSelectedLine] = useState(null);
+  const [activeTab, setActiveTab] = useState('taint'); // 'taint' | 'call'
   const diffEditorRef = useRef(null);
   const monacoRef = useRef(null);
   const decorationsRef = useRef([]);
@@ -49,14 +50,18 @@ const ReportViewer = () => {
       .catch(err => { setError(err.message); setLoading(false); });
   }, [id]);
 
-  const rfNodes = (report?.taint_path?.nodes || []).map(n => ({
+  const activeGraph = activeTab === 'call'
+    ? (report?.call_path || { nodes: [], edges: [] })
+    : (report?.taint_path || { nodes: [], edges: [] });
+
+  const rfNodes = (activeGraph.nodes || []).map(n => ({
     id: n.id,
     data: { label: n.label, role: n.role, file: n.file, start_line: n.start_line, start_col: n.start_col, end_col: n.end_col },
     style: { ...(ROLE_STYLE[n.role] || ROLE_STYLE.intermediate), borderRadius: 6, padding: '8px 12px', fontSize: 12, minWidth: NODE_WIDTH },
     position: { x: 0, y: 0 },
   }));
 
-  const rfEdges = (report?.taint_path?.edges || []).map(e => ({
+  const rfEdges = (activeGraph.edges || []).map(e => ({
     id: e.id,
     source: e.source,
     target: e.target,
@@ -130,18 +135,42 @@ const ReportViewer = () => {
       <div className="flex flex-1 overflow-hidden">
         {/* Left panel — taint flow graph (45%) */}
         <div className="flex flex-col border-r border-gray-700" style={{ width: '45%' }}>
-          <div className="px-3 py-2 bg-gray-800 border-b border-gray-700 text-sm font-semibold text-blue-200 shrink-0">
-            Source → Sink Taint Flow
-            <span className="ml-2 text-xs font-normal text-gray-400">click a node to jump to that line</span>
+          <div className="flex items-center bg-gray-800 border-b border-gray-700 shrink-0">
+            <button
+              onClick={() => setActiveTab('taint')}
+              className={`px-3 py-2 text-sm font-semibold border-b-2 ${
+                activeTab === 'taint'
+                  ? 'border-blue-400 text-blue-200'
+                  : 'border-transparent text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              Taint Flow
+            </button>
+            <button
+              onClick={() => setActiveTab('call')}
+              className={`px-3 py-2 text-sm font-semibold border-b-2 ${
+                activeTab === 'call'
+                  ? 'border-blue-400 text-blue-200'
+                  : 'border-transparent text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              Call Path
+            </button>
+            <span className="ml-auto pr-3 text-xs font-normal text-gray-400">
+              {activeTab === 'call' ? 'main → vulnerable function' : 'source → sink'} · click a node to jump to that line
+            </span>
           </div>
 
           <div className="flex-1 relative overflow-hidden">
             {layoutNodes.length === 0 ? (
               <div className="flex items-center justify-center h-full text-gray-500 text-sm">
-                No taint path data available for this job.
+                {activeTab === 'call'
+                  ? 'No call path from main to the vulnerable function for this job.'
+                  : 'No taint path data available for this job.'}
               </div>
             ) : (
               <ReactFlow
+                key={activeTab}
                 nodes={layoutNodes}
                 edges={rfEdges}
                 onNodeClick={onNodeClick}
@@ -161,15 +190,15 @@ const ReportViewer = () => {
           <div className="px-3 py-2 bg-gray-800 border-t border-gray-700 text-xs text-gray-400 flex items-center space-x-4 shrink-0">
             <span className="flex items-center space-x-1">
               <span className="inline-block w-3 h-3 rounded border-2 border-green-500 bg-green-900"></span>
-              <span>source</span>
+              <span>{activeTab === 'call' ? 'entry (main)' : 'source'}</span>
             </span>
             <span className="flex items-center space-x-1">
               <span className="inline-block w-3 h-3 rounded border-2 border-blue-500 bg-blue-900"></span>
-              <span>intermediate</span>
+              <span>{activeTab === 'call' ? 'caller' : 'intermediate'}</span>
             </span>
             <span className="flex items-center space-x-1">
               <span className="inline-block w-3 h-3 rounded border-2 border-red-500 bg-red-900"></span>
-              <span>sink</span>
+              <span>{activeTab === 'call' ? 'vulnerable fn' : 'sink'}</span>
             </span>
             {selectedLine && (
               <span className="ml-auto text-blue-300">

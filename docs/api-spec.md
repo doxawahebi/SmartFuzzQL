@@ -227,7 +227,7 @@ The Project Dashboard (`/dashboard`) consumes **only the shared `/ws` transport*
 
 ### GET /api/jobs/{task_id}/report
 
-Returns the full vulnerability report for a completed job, including the SARIF taint-flow graph and the original-vs-patch diff.
+Returns the full vulnerability report for a completed job, including the SARIF taint-flow graph, the `main`→vulnerable-function call-reachability graph, and the original-vs-patch diff.
 
 **Path parameter:** `task_id` — UUID returned from `POST /api/jobs`
 
@@ -249,6 +249,15 @@ Returns the full vulnerability report for a completed job, including the SARIF t
     ],
     "edges": [
       { "id": "e0", "source": "n0", "target": "n1" }
+    ]
+  },
+  "call_path": {
+    "nodes": [
+      { "id": "call-0", "label": "main", "role": "source", "file": "src/main.c", "start_line": 7, "start_col": 0, "end_col": 0 },
+      { "id": "call-1", "label": "vulnerable_func", "role": "sink", "file": "src/main.c", "start_line": 7, "start_col": 0, "end_col": 0 }
+    ],
+    "edges": [
+      { "id": "call-edge-0-1", "source": "call-0", "target": "call-1" }
     ]
   },
   "diff": {
@@ -431,6 +440,7 @@ All fields from `AdminJobSummary`, plus:
   "state":       "string",
   "vuln_summary": { "message": "string|null", "file": "string|null", "rule_id": "string|null" },
   "taint_path":  { "nodes": "TaintNode[]", "edges": "TaintEdge[]" },
+  "call_path":   { "nodes": "TaintNode[]", "edges": "TaintEdge[]" },
   "diff":        { "original": "string", "patched": "string", "language": "string" },
   "crash":       { "hex": "string | null" }
 }
@@ -438,4 +448,8 @@ All fields from `AdminJobSummary`, plus:
 
 **TaintNode:** `{ id, label, role, file, start_line, start_col, end_col }`  
 **TaintEdge:** `{ id, source, target }`  
+`taint_path` is the CodeQL source→sink data-flow path (roles: `source`/`intermediate`/`sink`).
+`call_path` is the static call-reachability chain from `main` to the vulnerable function
+(same node/edge shape; roles map `source`=entry `main`, `intermediate`=caller, `sink`=vulnerable fn).
+Both default to `{ "nodes": [], "edges": [] }` when unavailable.
 `diff.language` is inferred from `vuln_file` extension: `c`, `cpp`, or `plaintext`.

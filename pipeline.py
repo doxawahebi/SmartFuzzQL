@@ -84,9 +84,10 @@ def step_2_static_analysis(repo_dir):
     run_cmd(f"docker exec {CONTAINER_NAME} codeql database create {DB_NAME} --language=cpp --source-root={container_repo_path} --command=\"make\"")
     
     print("[+] Running custom CodeQL query...")
-    # download dependencies
-    run_cmd(f"docker exec {CONTAINER_NAME} codeql pack install /workspace")
-    run_cmd(f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} custom.ql --format=sarif-latest --output={SARIF_OUTPUT}")
+    # download dependencies (codeql/cpp-all powers the DataFlow taint query)
+    run_cmd(f"docker exec {CONTAINER_NAME} codeql pack install /workspace/backend/queries")
+    # Vulnerability-finding queries only; the call-graph query is a separate concern.
+    run_cmd(f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} /workspace/backend/queries/vulnerabilities --format=sarif-latest --output={SARIF_OUTPUT}")
 
 def call_llm_api(prompt):
     api_key = os.environ.get("GEMINI_API_KEY")

@@ -133,6 +133,57 @@ class AdminUsersResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Report endpoint schemas
+# ---------------------------------------------------------------------------
+
+class TaintNode(BaseModel):
+    id: str
+    label: str
+    role: str
+    file: str
+    start_line: int
+    start_col: int
+    end_col: int
+
+
+class TaintEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+
+
+class TaintPath(BaseModel):
+    nodes: list[TaintNode]
+    edges: list[TaintEdge]
+
+
+class DiffPayload(BaseModel):
+    original: str
+    patched: str
+    language: str
+
+
+class CrashInfo(BaseModel):
+    hex: str | None = None
+
+
+class VulnSummary(BaseModel):
+    message: str | None = None
+    file: str | None = None
+    rule_id: str | None = None
+
+
+class ReportResponse(BaseModel):
+    task_id: str
+    repo_url: str
+    state: str
+    vuln_summary: VulnSummary
+    taint_path: TaintPath
+    diff: DiffPayload
+    crash: CrashInfo
+
+
+# ---------------------------------------------------------------------------
 # In-memory job store (real-time WebSocket state)
 # ---------------------------------------------------------------------------
 
@@ -228,20 +279,29 @@ async def startup_event():
 
 
 async def redis_listener():
-    async for message in app.state.pubsub.listen():
-        if message["type"] == "message":
-            raw = message["data"].decode("utf-8")
+    while True:
+        try:
+            async for message in app.state.pubsub.listen():
+                if message["type"] == "message":
+                    raw = message["data"].decode("utf-8")
+                    try:
+                        payload = json.loads(raw)
+                        task_id = payload.get("task_id")
+                        if task_id and task_id in job_store:
+                            _update_job_store(task_id, payload)
+                            asyncio.get_event_loop().run_in_executor(
+                                None, _db_sync_update, task_id, payload
+                            )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                    await manager.broadcast(raw)
+        except Exception:
+            await asyncio.sleep(2)
             try:
-                payload = json.loads(raw)
-                task_id = payload.get("task_id")
-                if task_id and task_id in job_store:
-                    _update_job_store(task_id, payload)
-                    asyncio.get_event_loop().run_in_executor(
-                        None, _db_sync_update, task_id, payload
-                    )
-            except (json.JSONDecodeError, KeyError):
+                app.state.pubsub = app.state.redis.pubsub()
+                await app.state.pubsub.subscribe("pipeline_logs")
+            except Exception:
                 pass
-            await manager.broadcast(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +504,67 @@ def admin_get_job(task_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return AdminJobDetail.model_validate(job)
+
+
+@app.get("/api/jobs/{task_id}/report", response_model=ReportResponse)
+def get_report(task_id: str, db: Session = Depends(get_db)):
+    """
+    GET /api/jobs/{task_id}/report
+
+    Returns the full vulnerability report for a completed job, including the
+    SARIF taint-flow path (as {nodes, edges}) and the original-vs-patch diff.
+
+    Path params:
+        task_id (str) Job UUID
+
+    Response:
+        task_id      (str)         Job UUID
+        repo_url     (str)         Target repository URL
+        state        (str)         SUCCESS (guaranteed for a successful 200)
+        vuln_summary              message, file, rule_id (null until stored)
+        taint_path                nodes[] and edges[] derived from SARIF codeFlows
+        diff                      original and patched full source; language id
+        crash                     hex-encoded AFL++ crash input, or null
+
+    Errors:
+        404  Job not found
+        409  Job not complete — check X-Job-State response header for current state
+    """
+    job = db.query(Job).filter(Job.task_id == task_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state != "SUCCESS":
+        raise HTTPException(
+            status_code=409,
+            detail="Job not complete",
+            headers={"X-Job-State": job.state},
+        )
+
+    ext = (job.vuln_file or "").rsplit(".", 1)[-1].lower()
+    lang = {"c": "c", "h": "c", "cpp": "cpp", "cc": "cpp",
+            "cxx": "cpp", "hpp": "cpp"}.get(ext, "plaintext")
+
+    raw_path = job.taint_path or {"nodes": [], "edges": []}
+    return ReportResponse(
+        task_id=job.task_id,
+        repo_url=job.repo_url,
+        state=job.state,
+        vuln_summary=VulnSummary(
+            message=job.vuln_message,
+            file=job.vuln_file,
+            rule_id=None,
+        ),
+        taint_path=TaintPath(
+            nodes=[TaintNode(**n) for n in raw_path.get("nodes", [])],
+            edges=[TaintEdge(**e) for e in raw_path.get("edges", [])],
+        ),
+        diff=DiffPayload(
+            original=job.original_code or job.code_snippet or "",
+            patched=job.patch_code or "",
+            language=lang,
+        ),
+        crash=CrashInfo(hex=job.crash_hex),
+    )
 
 
 @app.get("/admin/dashboard/users", response_model=AdminUsersResponse)

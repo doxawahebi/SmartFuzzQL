@@ -1,7 +1,7 @@
 import os
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@db:5432/hast_db")
@@ -22,3 +22,9 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     import models  # noqa: F401 — registers Job model with Base
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        for col, typedef in [("original_code", "TEXT"), ("taint_path", "JSONB")]:
+            conn.execute(text(
+                f"ALTER TABLE jobs ADD COLUMN IF NOT EXISTS {col} {typedef}"
+            ))
+        conn.commit()

@@ -1,3 +1,8 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Monaco line highlight injected by ReportViewer node-click interaction */
+.report-selected-line {
+  background: rgba(251, 191, 36, 0.15) !important;
+}

@@ -53,6 +53,37 @@ def copy_text_to_container(container, target_dir: str, filename: str, content: s
     tar_buffer.seek(0)
     container.put_archive(target_dir, tar_buffer.getvalue())
 
+def _extract_taint_path(sarif_result: dict) -> dict:
+    """Transform a SARIF result's codeFlows into {nodes, edges} for the report API."""
+    code_flows = sarif_result.get("codeFlows", [])
+    if not code_flows:
+        return {"nodes": [], "edges": []}
+    locations = (
+        code_flows[0]
+        .get("threadFlows", [{}])[0]
+        .get("locations", [])
+    )
+    nodes, edges = [], []
+    n = len(locations)
+    for i, loc_wrapper in enumerate(locations):
+        phys = loc_wrapper.get("location", {}).get("physicalLocation", {})
+        region = phys.get("region", {})
+        label = loc_wrapper.get("location", {}).get("message", {}).get("text", f"step-{i}")
+        role = "source" if i == 0 else ("sink" if i == n - 1 else "intermediate")
+        nodes.append({
+            "id": f"node-{i}",
+            "label": label,
+            "role": role,
+            "file": phys.get("artifactLocation", {}).get("uri", ""),
+            "start_line": region.get("startLine", 0),
+            "start_col": region.get("startColumn", 0),
+            "end_col": region.get("endColumn", 0),
+        })
+        if i > 0:
+            edges.append({"id": f"edge-{i-1}-{i}", "source": f"node-{i-1}", "target": f"node-{i}"})
+    return {"nodes": nodes, "edges": edges}
+
+
 @celery_app.task(bind=True)
 def run_pipeline(self, repo_url: str):
     task_id = self.request.id
@@ -326,6 +357,8 @@ def run_pipeline(self, repo_url: str):
                     job_row.vuln_message = vuln_msg
                     job_row.vuln_file = vuln_file
                     job_row.code_snippet = vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None
+                    job_row.original_code = vuln_code if vuln_code != "Code not found 243234234234234234" else None
+                    job_row.taint_path = _extract_taint_path(results[0]) if results else {"nodes": [], "edges": []}
                     job_row.patch_generated = True
                     job_row.crash_hex = crash_data.hex() if crash_data else None
                     job_row.patch_code = patch_code

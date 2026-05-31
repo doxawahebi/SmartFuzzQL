@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import ReactFlow, { Background, Controls } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
@@ -21,17 +22,15 @@ const initialEdges = [
   { id: 'e5-6', source: '5', target: '6' },
 ];
 
-const mockStats = [
-  { time: '0m', execs: 400, crashes: 0 },
-  { time: '5m', execs: 1200, crashes: 0 },
-  { time: '10m', execs: 2100, crashes: 1 },
-];
-
 const Dashboard = () => {
   const [nodes, setNodes] = useState(initialNodes);
   const [edges, setEdges] = useState(initialEdges);
   const [repoUrl, setRepoUrl] = useState("");
   const [logs, setLogs] = useState([]);
+  const [vulnData, setVulnData] = useState(null);
+  const [pipelineResult, setPipelineResult] = useState(null);
+  const [fuzzStats, setFuzzStats] = useState([]);
+  const [taskId, setTaskId] = useState(null);
 
   const nodeMap = {
     "INIT": "1",
@@ -52,7 +51,6 @@ const Dashboard = () => {
   useEffect(() => {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsHost = window.location.hostname;
-    // Assuming backend is on port 8000 if frontend is accessed remotely
     const wsUrl = `${wsProtocol}//${wsHost}:8000/ws`;
     const ws = new WebSocket(wsUrl);
     ws.onmessage = (event) => {
@@ -81,6 +79,20 @@ const Dashboard = () => {
             return node;
           }));
         }
+
+        if (data.vuln) {
+          setVulnData(data.vuln);
+        }
+
+        if (data.result) {
+          setPipelineResult(data.result);
+        }
+
+        if (data.step === "DAST" && data.fuzz_stats) {
+          const { time_sec, execs, crashes } = data.fuzz_stats;
+          const minutes = Math.floor(time_sec / 60);
+          setFuzzStats((prev) => [...prev, { time: `${minutes}m`, execs, crashes }]);
+        }
       } catch (err) {
         setLogs((prev) => [...prev, event.data]);
       }
@@ -89,6 +101,10 @@ const Dashboard = () => {
   }, []);
 
   const handleStartPipeline = async () => {
+    setVulnData(null);
+    setPipelineResult(null);
+    setFuzzStats([]);
+    setTaskId(null);
     try {
       const apiHost = window.location.hostname;
       const apiUrl = `${window.location.protocol}//${apiHost}:8000/api/jobs`;
@@ -98,6 +114,7 @@ const Dashboard = () => {
         body: JSON.stringify({ repo_url: repoUrl })
       });
       const data = await res.json();
+      setTaskId(data.task_id);
       setLogs((prev) => [...prev, `Job submitted: ${data.task_id}`]);
     } catch (err) {
       console.error(err);
@@ -107,15 +124,15 @@ const Dashboard = () => {
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white p-4 font-sans">
       <h1 className="text-3xl font-bold mb-4">HAST Full-Stack Dashboard</h1>
-      
+
       <div className="mb-4 flex space-x-2">
-        <input 
-          className="flex-1 p-2 bg-gray-800 border border-gray-700 rounded" 
-          placeholder="GitHub URL or Source Code" 
-          value={repoUrl} 
+        <input
+          className="flex-1 p-2 bg-gray-800 border border-gray-700 rounded"
+          placeholder="GitHub URL or Source Code"
+          value={repoUrl}
           onChange={(e) => setRepoUrl(e.target.value)}
         />
-        <button 
+        <button
           className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold"
           onClick={handleStartPipeline}
         >
@@ -123,60 +140,107 @@ const Dashboard = () => {
         </button>
       </div>
 
-      <div className="flex flex-1 space-x-4">
-        <div className="flex flex-col w-1/2 space-y-4">
+      <div className="flex flex-1 space-x-4 overflow-hidden">
+        {/* Left column */}
+        <div className="flex flex-col w-1/2 space-y-4 overflow-hidden">
           <div className="flex-1 bg-gray-800 rounded border border-gray-700 relative">
-             <ReactFlow nodes={nodes} edges={edges} fitView>
-               <Background color="#444" gap={16} />
-               <Controls />
-             </ReactFlow>
+            <ReactFlow nodes={nodes} edges={edges} fitView>
+              <Background color="#444" gap={16} />
+              <Controls />
+            </ReactFlow>
           </div>
-          
-          <div className="h-64 bg-gray-800 rounded border border-gray-700 p-2">
-            <h2 className="text-xl font-semibold mb-2 text-center text-blue-200">Live Fuzzer Stats</h2>
-            <ResponsiveContainer width="100%" height="80%">
-              <LineChart data={mockStats}>
+
+          <div className="h-52 bg-gray-800 rounded border border-gray-700 p-2">
+            <h2 className="text-lg font-semibold mb-1 text-center text-blue-200">Live Fuzzer Stats</h2>
+            <ResponsiveContainer width="100%" height="85%">
+              <LineChart data={fuzzStats}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#444" />
                 <XAxis dataKey="time" stroke="#ccc" />
                 <YAxis stroke="#ccc" />
-                <Tooltip contentStyle={{backgroundColor: '#333', borderColor: '#555'}} />
+                <Tooltip contentStyle={{ backgroundColor: '#333', borderColor: '#555' }} />
                 <Legend />
                 <Line type="monotone" dataKey="execs" stroke="#3b82f6" activeDot={{ r: 8 }} />
                 <Line type="monotone" dataKey="crashes" stroke="#ef4444" />
               </LineChart>
             </ResponsiveContainer>
           </div>
+
+          {/* Vulnerability Panel */}
+          <div className="bg-gray-800 rounded border border-gray-700 p-3">
+            <h2 className="text-lg font-semibold mb-2 text-yellow-300">Detected Vulnerability</h2>
+            {vulnData ? (
+              <div className="space-y-1 text-sm">
+                <div>
+                  <span className="text-gray-400">Message: </span>
+                  <span className="text-white">{vulnData.message}</span>
+                </div>
+                <div>
+                  <span className="text-gray-400">File: </span>
+                  <span className="text-blue-300 font-mono">{vulnData.file}</span>
+                </div>
+                {vulnData.code_snippet && (
+                  <pre className="mt-2 bg-gray-900 p-2 rounded text-xs text-green-300 overflow-x-auto whitespace-pre-wrap max-h-24">
+                    {vulnData.code_snippet}
+                  </pre>
+                )}
+              </div>
+            ) : (
+              <p className="text-gray-500 text-sm">No vulnerability detected yet.</p>
+            )}
+            {pipelineResult && (
+              <div className="mt-3 pt-3 border-t border-gray-700 text-sm flex items-center space-x-3 flex-wrap gap-y-2">
+                <span className={`px-2 py-0.5 rounded text-xs font-bold ${pipelineResult.patch_generated ? 'bg-green-700 text-green-200' : 'bg-gray-600 text-gray-300'}`}>
+                  {pipelineResult.patch_generated ? 'PATCH GENERATED' : 'NO PATCH'}
+                </span>
+                {pipelineResult.crash_hex && (
+                  <span className="text-red-400 text-xs font-mono">
+                    Crash: {pipelineResult.crash_hex.slice(0, 16)}…
+                  </span>
+                )}
+                {taskId && (
+                  <Link
+                    to={`/report/${taskId}`}
+                    className="ml-auto px-3 py-1 bg-blue-700 hover:bg-blue-600 text-blue-100 text-xs rounded font-semibold"
+                  >
+                    View Full Report →
+                  </Link>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
-        <div className="flex flex-col w-1/2 space-y-4">
-           <div className="flex-1 bg-gray-800 rounded border border-gray-700 flex flex-col">
-              <h2 className="p-2 border-b border-gray-700 bg-gray-900 font-semibold flex justify-between text-blue-200">
-                 <span>Source Code / Patch Diff Viewer</span>
-                 <span className="text-xs text-gray-400">Monaco Editor</span>
-              </h2>
-              <div className="flex-1 p-1">
-                <Editor 
-                  height="100%" 
-                  defaultLanguage="cpp" 
-                  theme="vs-dark" 
-                  defaultValue="// View AI-generated source logic patches or harnesses here..."
-                />
-              </div>
-           </div>
+        {/* Right column */}
+        <div className="flex flex-col w-1/2 space-y-4 overflow-hidden">
+          <div className="flex-1 bg-gray-800 rounded border border-gray-700 flex flex-col overflow-hidden">
+            <h2 className="p-2 border-b border-gray-700 bg-gray-900 font-semibold flex justify-between text-blue-200">
+              <span>Source Code / Patch Diff Viewer</span>
+              <span className="text-xs text-gray-400">Monaco Editor</span>
+            </h2>
+            <div className="flex-1 p-1">
+              <Editor
+                height="100%"
+                defaultLanguage="cpp"
+                theme="vs-dark"
+                value={pipelineResult?.patch_code ?? "// View AI-generated source logic patches or harnesses here..."}
+                options={{ readOnly: !!pipelineResult?.patch_code }}
+              />
+            </div>
+          </div>
 
-           <div className="h-48 bg-black rounded border border-gray-700 p-3 overflow-y-auto text-sm drop-shadow-md font-mono">
-             <h2 className="font-semibold mb-2 text-green-400 border-b border-gray-800 pb-1">user@hast-pipeline:~/logs$</h2>
-             {logs.map((log, idx) => {
-               const isError = log.includes('Failed') || log.includes('ERROR');
-               const isSuccess = log.includes('Success');
-               return (
-                 <div key={idx} className={isError ? "text-red-400" : isSuccess ? "text-green-400" : "text-gray-300"}>
-                   {`> ${log}`}
-                 </div>
-               );
-             })}
-             <div ref={logsEndRef} />
-           </div>
+          <div className="h-48 bg-black rounded border border-gray-700 p-3 overflow-y-auto text-sm drop-shadow-md font-mono">
+            <h2 className="font-semibold mb-2 text-green-400 border-b border-gray-800 pb-1">user@hast-pipeline:~/logs$</h2>
+            {logs.map((log, idx) => {
+              const isError = log.includes('Failed') || log.includes('ERROR');
+              const isSuccess = log.includes('Success');
+              return (
+                <div key={idx} className={isError ? "text-red-400" : isSuccess ? "text-green-400" : "text-gray-300"}>
+                  {`> ${log}`}
+                </div>
+              );
+            })}
+            <div ref={logsEndRef} />
+          </div>
         </div>
       </div>
     </div>

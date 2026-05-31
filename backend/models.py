@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text
 
 from database import Base
 
@@ -21,3 +21,5 @@ class Job(Base):
     patch_generated = Column(Boolean, nullable=True)
     crash_hex       = Column(Text, nullable=True)
     patch_code      = Column(Text, nullable=True)
+    original_code   = Column(Text, nullable=True)
+    taint_path      = Column(JSON, nullable=True)

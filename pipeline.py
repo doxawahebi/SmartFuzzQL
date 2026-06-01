@@ -12,6 +12,12 @@ from google.genai import types
 
 # Configure target files and components
 WORKSPACE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+# Reuse the backend's Auto-Remediation helpers so the CLI and the Celery backend share one
+# patch prompt and one function-scoped diff implementation (see backend/patching.py).
+sys.path.insert(0, os.path.join(WORKSPACE_DIR, "backend"))
+import patching  # noqa: E402
+
 DOCKER_IMAGE = "hast-env"
 CONTAINER_NAME = "hast-container"
 DB_NAME = "my-db"
@@ -21,9 +27,12 @@ FUZZ_TARGET = "fuzz_target"
 MAX_RETRIES = 3
 FUZZ_TIMEOUT_SEC = 20 * 60  # 20 minutes
 
+
 def run_cmd(cmd, check=True):
     print(f"[*] Running: {cmd}")
-    result = subprocess.run(cmd, shell=True, cwd=WORKSPACE_DIR, text=True, capture_output=True)
+    result = subprocess.run(
+        cmd, shell=True, cwd=WORKSPACE_DIR, text=True, capture_output=True
+    )
     if check and result.returncode != 0:
         print(f"[!] Command failed: {cmd}")
         print("STDOUT:", result.stdout)
@@ -31,80 +40,100 @@ def run_cmd(cmd, check=True):
         sys.exit(1)
     return result
 
+
 def is_valid_github_url(url):
     parsed = urllib.parse.urlparse(url)
-    return parsed.scheme in ["http", "https"] and parsed.netloc in ["github.com", "www.github.com"]
+    return parsed.scheme in ["http", "https"] and parsed.netloc in [
+        "github.com",
+        "www.github.com",
+    ]
+
 
 def step_0_fetch_repo(url, branch=None):
     print(f"[+] Step 0: Fetching repository from {url}...")
     if not is_valid_github_url(url):
         print(f"[!] Invalid GitHub URL: {url}")
         sys.exit(1)
-        
+
     temp_dir = tempfile.mkdtemp(dir=WORKSPACE_DIR, prefix="repo_")
     print(f"    - Cloning into {temp_dir}...")
-    
+
     clone_cmd = ["git", "clone", "--depth", "1"]
     if branch:
         clone_cmd.extend(["--branch", branch])
     clone_cmd.extend([url, temp_dir])
-    
+
     res = subprocess.run(clone_cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"[!] Git clone failed.")
         print("STDERR:", res.stderr)
         shutil.rmtree(temp_dir, ignore_errors=True)
         sys.exit(1)
-        
+
     return temp_dir
+
 
 def step_1_setup_environment():
     print("[+] Step 1: Building Docker environment...")
     run_cmd(f"docker build -t {DOCKER_IMAGE} .")
-    
+
     print("[+] Starting isolated Docker container...")
     # Remove old container if it exists
     run_cmd(f"docker rm -f {CONTAINER_NAME}", check=False)
-    
+
     # Start container with volume attached
-    run_cmd(f"docker run -d --privileged --name {CONTAINER_NAME} -v {WORKSPACE_DIR}:/workspace -w /workspace {DOCKER_IMAGE} tail -f /dev/null")
+    run_cmd(
+        f"docker run -d --privileged --name {CONTAINER_NAME} -v {WORKSPACE_DIR}:/workspace -w /workspace {DOCKER_IMAGE} tail -f /dev/null"
+    )
+
 
 def step_2_static_analysis(repo_dir):
     print("[+] Step 2: Creating CodeQL Database...")
     rel_repo = os.path.basename(repo_dir)
     container_repo_path = f"/workspace/{rel_repo}"
-    
+
     # Clean workspace old artifacts
     run_cmd(f"docker exec {CONTAINER_NAME} make clean", check=False)
     run_cmd(f"docker exec {CONTAINER_NAME} rm -rf {DB_NAME} {SARIF_OUTPUT}")
-    
+
     # Run configure before codeql if a configure script exists, or let CodeQL build it
-    run_cmd(f"docker exec {CONTAINER_NAME} sh -c 'cd {container_repo_path} && if [ -f configure ]; then ./configure; fi'", check=False)
-    
-    run_cmd(f"docker exec {CONTAINER_NAME} codeql database create {DB_NAME} --language=cpp --source-root={container_repo_path} --command=\"make\"")
-    
+    run_cmd(
+        f"docker exec {CONTAINER_NAME} sh -c 'cd {container_repo_path} && if [ -f configure ]; then ./configure; fi'",
+        check=False,
+    )
+
+    run_cmd(
+        f'docker exec {CONTAINER_NAME} codeql database create {DB_NAME} --language=cpp --source-root={container_repo_path} --command="make"'
+    )
+
     print("[+] Running custom CodeQL query...")
     # download dependencies (codeql/cpp-all powers the DataFlow taint query)
-    run_cmd(f"docker exec {CONTAINER_NAME} codeql pack install /workspace/backend/queries")
+    run_cmd(
+        f"docker exec {CONTAINER_NAME} codeql pack install /workspace/backend/queries"
+    )
     # Vulnerability-finding queries only; the call-graph query is a separate concern.
-    run_cmd(f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} /workspace/backend/queries/vulnerabilities --format=sarif-latest --output={SARIF_OUTPUT}")
+    run_cmd(
+        f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} /workspace/backend/queries/vulnerabilities --format=sarif-latest --output={SARIF_OUTPUT}"
+    )
+
 
 def call_llm_api(prompt):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("[!] GEMINI_API_KEY environment variable is not set. Cannot use LLM.")
         sys.exit(1)
-        
+
     client = genai.Client(api_key=api_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-pro',
+            model="gemini-2.5-pro",
             contents=prompt,
         )
         return response.text
     except Exception as e:
         print(f"[!] LLM API Call Failed: {e}")
         return ""
+
 
 def extract_c_code(llm_response):
     if "```c" in llm_response:
@@ -117,24 +146,25 @@ def extract_c_code(llm_response):
         return llm_response[start:end].strip()
     return llm_response.strip()
 
+
 def step_3_4_dynamic_harness_loop(repo_dir):
     print("[+] Step 3: Parsing SARIF and beginning dynamic harness generation loop...")
-    
+
     rel_repo = os.path.basename(repo_dir)
     container_repo_path = f"/workspace/{rel_repo}"
-    
+
     sarif_path = os.path.join(WORKSPACE_DIR, SARIF_OUTPUT)
     if not os.path.exists(sarif_path):
         print("[!] SARIF file not found.")
         sys.exit(1)
-        
-    with open(sarif_path, 'r') as f:
+
+    with open(sarif_path, "r") as f:
         try:
             sarif_data = json.load(f)
         except Exception as e:
             print(f"[!] Failed to parse SARIF: {e}")
             sys.exit(1)
-            
+
     vuln_file = "unknown"
     codeql_msg = ""
     runs = sarif_data.get("runs", [])
@@ -143,7 +173,7 @@ def step_3_4_dynamic_harness_loop(repo_dir):
         if results:
             first_result = results[0]
             codeql_msg = first_result.get("message", {}).get("text", "")
-            
+
             locations = first_result.get("locations", [])
             if locations:
                 phys_loc = locations[0].get("physicalLocation", {})
@@ -151,20 +181,20 @@ def step_3_4_dynamic_harness_loop(repo_dir):
                 uri = art_loc.get("uri", "")
                 if uri:
                     vuln_file = uri
-                    
+
             print(f"    - CodeQL Result: {codeql_msg}")
-            
+
     if vuln_file == "unknown":
         print("[!] No vulnerabilities or vulnerable file detected by CodeQL. Exiting.")
         sys.exit(1)
-        
+
     vuln_file_host_path = os.path.join(repo_dir, vuln_file)
-    with open(vuln_file_host_path, 'r') as f:
+    with open(vuln_file_host_path, "r") as f:
         target_source_code = f.read()
 
     context = []
     crash_file = None
-    
+
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n[+] --- LLM Generation Attempt {attempt}/{MAX_RETRIES} ---")
         prompt = f"""
@@ -201,30 +231,44 @@ Output ONLY the C code, inside a ```c block.
         run_cmd(f"docker exec {CONTAINER_NAME} rm -f {FUZZ_TARGET}", check=False)
         compile_res = subprocess.run(
             f"docker exec -e AFL_USE_ASAN=1 {CONTAINER_NAME} afl-clang-fast -I /workspace/{rel_repo} -o {FUZZ_TARGET} {HARNESS_FILE} -lpcap",
-            shell=True, capture_output=True, text=True, cwd=WORKSPACE_DIR
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE_DIR,
         )
 
         if compile_res.returncode != 0:
             print(f"    - [!] Compilation failed.")
-            context.append(f"Compilation failed with error:\nSTDERR:\n{compile_res.stderr}\nCode:\n{harness_code}")
-            continue # Try LLM generation again
-            
+            context.append(
+                f"Compilation failed with error:\nSTDERR:\n{compile_res.stderr}\nCode:\n{harness_code}"
+            )
+            continue  # Try LLM generation again
+
         print("    - Compilation successful. Starting fuzzer...")
         run_cmd(f"docker exec {CONTAINER_NAME} rm -rf inputs outputs", check=False)
         run_cmd(f"docker exec {CONTAINER_NAME} mkdir -p inputs")
         run_cmd(f"docker exec {CONTAINER_NAME} sh -c 'echo \"A\" > inputs/seed'")
-        run_cmd(f"docker exec {CONTAINER_NAME} sh -c 'echo core > /proc/sys/kernel/core_pattern'")
+        run_cmd(
+            f"docker exec {CONTAINER_NAME} sh -c 'echo core > /proc/sys/kernel/core_pattern'"
+        )
 
         # Run fuzzer in background.
         fuzz_cmd = f"docker exec -e AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 -e AFL_SKIP_CPUFREQ=1 {CONTAINER_NAME} afl-fuzz -i inputs -o outputs -- ./{FUZZ_TARGET}"
-        proc = subprocess.Popen(fuzz_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+        proc = subprocess.Popen(
+            fuzz_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
         print(f"    - Fuzzer running. Wait limit: {FUZZ_TIMEOUT_SEC/60:.1f} minutes...")
-        
+
         start_time = time.time()
-        
+
         while time.time() - start_time < FUZZ_TIMEOUT_SEC:
-            res = subprocess.run(f"docker exec {CONTAINER_NAME} sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", shell=True, text=True, capture_output=True)
+            res = subprocess.run(
+                f"docker exec {CONTAINER_NAME} sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'",
+                shell=True,
+                text=True,
+                capture_output=True,
+            )
             if res.returncode == 0 and res.stdout.strip():
                 crashes = res.stdout.strip().split()
                 if crashes:
@@ -232,14 +276,14 @@ Output ONLY the C code, inside a ```c block.
                     run_cmd(f"docker exec {CONTAINER_NAME} chmod -R 777 outputs")
                     crash_file = crash_file_in_container.replace("/workspace/", "")
                     if not crash_file.startswith("outputs/"):
-                         crash_file = crash_file.split("\n")[0]
+                        crash_file = crash_file.split("\n")[0]
                     print(f"    - [!] CRASH TRIGGERED! Crash File: {crash_file}")
                     break
-            
+
             # Check if fuzzer completely died/finished early
             if proc.poll() is not None:
-                 print("    - [!] Fuzzer exited prematurely.")
-                 break
+                print("    - [!] Fuzzer exited prematurely.")
+                break
             time.sleep(1)
 
         # Cleanup fuzzer for next iteration or completion
@@ -254,25 +298,97 @@ Output ONLY the C code, inside a ```c block.
             print(f"[+] Crash found successfully in attempt {attempt}.")
             break
         else:
-            print(f"    - [!] Attempt {attempt} failed to find a crash within timeout. Analyzing fuzzer stats...")
+            print(
+                f"    - [!] Attempt {attempt} failed to find a crash within timeout. Analyzing fuzzer stats..."
+            )
             # Capture stats for feedback
-            stats_res = subprocess.run(f"docker exec {CONTAINER_NAME} cat outputs/default/fuzzer_stats", shell=True, text=True, capture_output=True)
-            stats = stats_res.stdout.strip() if stats_res.returncode == 0 else "Fuzzer stats totally unreadable or fuzzer failed immediately."
-            context.append(f"Harness compiled but failed to trigger a crash in the {FUZZ_TIMEOUT_SEC/60:.1f} minute timeout.\nFuzzer Stats:\n{stats}\nPrevious Code Iteration:\n{harness_code}")
+            stats_res = subprocess.run(
+                f"docker exec {CONTAINER_NAME} cat outputs/default/fuzzer_stats",
+                shell=True,
+                text=True,
+                capture_output=True,
+            )
+            stats = (
+                stats_res.stdout.strip()
+                if stats_res.returncode == 0
+                else "Fuzzer stats totally unreadable or fuzzer failed immediately."
+            )
+            context.append(
+                f"Harness compiled but failed to trigger a crash in the {FUZZ_TIMEOUT_SEC/60:.1f} minute timeout.\nFuzzer Stats:\n{stats}\nPrevious Code Iteration:\n{harness_code}"
+            )
 
     if not crash_file:
-        print(f"[!] Exhausted {MAX_RETRIES} attempts without a crash. Returning failure.")
+        print(
+            f"[!] Exhausted {MAX_RETRIES} attempts without a crash. Returning failure."
+        )
         sys.exit(1)
-        
+
     return crash_file
 
-def step_5_reporting(crash_file):
-    print("[+] Step 5: Generating Final Report...")
-    
+
+def _parse_sarif_vuln(repo_dir):
+    """Return (vuln_file, codeql_msg, vuln_line, source) for the first SARIF finding, or
+    (None, "", None, "") when nothing usable is present."""
+    sarif_path = os.path.join(WORKSPACE_DIR, SARIF_OUTPUT)
+    if not os.path.exists(sarif_path):
+        return None, "", None, ""
+    with open(sarif_path, "r") as f:
+        sarif_data = json.load(f)
+    results = sarif_data.get("runs", [{}])[0].get("results", [])
+    if not results:
+        return None, "", None, ""
+    first = results[0]
+    codeql_msg = first.get("message", {}).get("text", "")
+    physical = (first.get("locations", [{}])[0]).get("physicalLocation", {})
+    vuln_file = physical.get("artifactLocation", {}).get("uri", "")
+    vuln_line = physical.get("region", {}).get("startLine")
+    source = ""
+    if vuln_file:
+        host_path = os.path.join(repo_dir, vuln_file)
+        if os.path.exists(host_path):
+            with open(host_path, "r") as f:
+                source = f.read()
+    return vuln_file, codeql_msg, vuln_line, source
+
+
+def step_5_patch(repo_dir, crash_data):
+    """AI patch stage: feed the enclosing vulnerable function to the LLM and splice the patched
+    function back into the file, mirroring the Celery backend's AI_PATCH step."""
+    print("[+] Step 5: Generating AI security patch...")
+    vuln_file, codeql_msg, vuln_line, source = _parse_sarif_vuln(repo_dir)
+    if not source:
+        print("    - [!] No vulnerable source available; skipping patch generation.")
+        return None
+
+    vuln_function = patching.extract_vulnerable_function(source, vuln_line)
+    snippet = vuln_function or patching.truncate_for_prompt(source)
+    prompt = patching.build_patch_prompt(snippet, codeql_msg, crash_data.hex())
+
+    print("    - Requesting patch from Gemini API...")
+    patched_function = patching.extract_c_code(call_llm_api(prompt))
+    if not patched_function:
+        print("    - [!] LLM returned no patch.")
+        return None
+    patch_code = (
+        patching.splice_patch(source, vuln_line, patched_function)
+        if vuln_function
+        else patched_function
+    )
+
+    patch_path = os.path.join(WORKSPACE_DIR, "patched_" + os.path.basename(vuln_file))
+    with open(patch_path, "w") as f:
+        f.write(patch_code)
+    print(f"    - Wrote patched source to {os.path.basename(patch_path)}")
+    return {"file": vuln_file, "original": source, "patched": patch_code}
+
+
+def step_5_reporting(crash_file, patch_info=None):
+    print("[+] Step 6: Generating Final Report...")
+
     crash_path = os.path.join(WORKSPACE_DIR, crash_file)
     with open(crash_path, "rb") as f:
         crash_data = f.read()
-        
+
     report = {
         "status": "VULNERABILITY_PROVEN",
         "pipeline": "HAST (CodeQL + AFL++)",
@@ -281,41 +397,58 @@ def step_5_reporting(crash_file):
         "static_analysis": {
             "tool": "CodeQL",
             "query": "custom.ql (cpp/buffer-overflow-strcpy)",
-            "finding": "Potential buffer overflow from function parameter to strcpy"
+            "finding": "Potential buffer overflow from function parameter to strcpy",
         },
         "dynamic_analysis": {
             "tool": "AFL++",
             "crash_triggered": True,
             "crash_input_hex": crash_data.hex(),
-            "crash_input_repr": repr(crash_data)
-        }
+            "crash_input_repr": repr(crash_data),
+        },
+        "auto_remediation": {
+            "patch_generated": bool(patch_info),
+            "file": patch_info["file"] if patch_info else None,
+            "original_code": patch_info["original"] if patch_info else None,
+            "patched_code": patch_info["patched"] if patch_info else None,
+        },
     }
-    
+
     report_file = os.path.join(WORKSPACE_DIR, "vulnerability_report.json")
     with open(report_file, "w") as f:
         json.dump(report, f, indent=4)
-        
+
     print(f"[+] Report generated at {report_file}")
-    
+
     # Store artifacts explicitly as requested
-    artifacts_dir = "/home/cks/.gemini/antigravity/brain/94fd1d5c-9c1a-4123-98a3-4958cd73faa3"
+    artifacts_dir = (
+        "/home/cks/.gemini/antigravity/brain/94fd1d5c-9c1a-4123-98a3-4958cd73faa3"
+    )
     shutil.copy("pipeline.py", os.path.join(artifacts_dir, "pipeline_script.py"))
     shutil.copy("Dockerfile", os.path.join(artifacts_dir, "dockerfile.txt"))
-    shutil.copy("vulnerability_report.json", os.path.join(artifacts_dir, "vulnerability_report.json"))
+    shutil.copy(
+        "vulnerability_report.json",
+        os.path.join(artifacts_dir, "vulnerability_report.json"),
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(description="HAST Pipeline")
     parser.add_argument("repo_url", help="GitHub repository URL to analyze")
-    parser.add_argument("--branch", help="Specific branch or tag to clone", default=None)
+    parser.add_argument(
+        "--branch", help="Specific branch or tag to clone", default=None
+    )
     args = parser.parse_args()
-    
+
     repo_dir = None
     try:
         repo_dir = step_0_fetch_repo(args.repo_url, args.branch)
         step_1_setup_environment()
         step_2_static_analysis(repo_dir)
         crash_file = step_3_4_dynamic_harness_loop(repo_dir)
-        step_5_reporting(crash_file)
+        with open(os.path.join(WORKSPACE_DIR, crash_file), "rb") as f:
+            crash_data = f.read()
+        patch_info = step_5_patch(repo_dir, crash_data)
+        step_5_reporting(crash_file, patch_info)
         print("[*] Pipeline completed successfully.")
     except Exception as e:
         print(f"[!] Pipeline failed: {e}")
@@ -326,6 +459,7 @@ def main():
         if repo_dir and os.path.exists(repo_dir):
             print(f"[*] Cleaning up temporary repository directory: {repo_dir}")
             shutil.rmtree(repo_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     main()

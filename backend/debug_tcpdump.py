@@ -8,7 +8,9 @@ reaches a SUCCESS `bootp_print` report:
   - clone : tolerated if offline.
   - SAST  : on CodeQL failure, drop in `debug_assets/bootp_sa.sarif` (genuine
             `bootp_print.ql` output) at the path tasks.py reads.
-  - AI    : on LLM failure, use `debug_assets/harness.c` / `mock_patch.c`.
+  - AI    : on LLM failure, use `debug_assets/harness.c`; the patch is synthesized from the
+            real vulnerable function in the prompt (bound-check inserted), falling back to
+            `debug_assets/bootp_patch.c`.
   - DAST  : if the LLM-generated harness fails to build (3 attempts), swap in the
             known-good `debug_assets/harness.c`, build tcpdump (-> libnetdissect.a),
             compile the harness against it, and **actually fuzz with AFL++ to find a real
@@ -21,6 +23,7 @@ we monkeypatch the mock-agnostic boundary functions tasks.py exposes (`clone_rep
   - runtime worker: `celery -A tasks.celery_app worker --include=debug_tcpdump`
   - tests: `import debug_tcpdump` (auto-activates when the flag is set)
 """
+
 import os
 import shutil
 
@@ -32,12 +35,14 @@ _DEBUG_ASSETS = os.path.join(_HERE, "debug_assets")
 TCPDUMP_REPO_URL = "https://github.com/doxawahebi/tcpdump-4.9.1"
 BOOTP_SARIF = os.path.join(_DEBUG_ASSETS, "bootp_sa.sarif")
 HARNESS_C = os.path.join(_DEBUG_ASSETS, "harness.c")
-MOCK_PATCH_C = os.path.join(_DEBUG_ASSETS, "mock_patch.c")
+# Topical bootp_print patch (NOT the generic mock_patch.c) so the fallback diff relates to the
+# real vulnerability instead of an unrelated strcpy snippet.
+BOOTP_PATCH_C = os.path.join(_DEBUG_ASSETS, "bootp_patch.c")
 
 # Per-attempt fuzzing budget and number of attempts. bootp_print crashes within seconds
 # from short seeds; AFL's forkserver occasionally aborts at startup (ASAN-nondeterministic
 # calibration on this harness), so we retry rather than fail.
-FUZZ_TIMEOUT = int(os.environ.get("TCPDUMP_FUZZ_TIMEOUT", "90"))     # seconds per attempt
+FUZZ_TIMEOUT = int(os.environ.get("TCPDUMP_FUZZ_TIMEOUT", "90"))  # seconds per attempt
 FUZZ_ATTEMPTS = int(os.environ.get("TCPDUMP_FUZZ_ATTEMPTS", "6"))
 
 # Build tcpdump instrumented (-> libnetdissect.a) and link the known-good harness against
@@ -58,7 +63,7 @@ _BUILD_HARNESS_CMD = (
 # (so AFL's dry run does not crash the forkserver) but are one mutation away from the
 # unchecked EXTRACT_16BITS(&bp->bp_flags) read at print-bootp.c -> a quick OOB crash.
 _SEED_CMD = (
-    "cd /target && rm -rf inputs && mkdir -p inputs && python3 -c \""
+    'cd /target && rm -rf inputs && mkdir -p inputs && python3 -c "'
     "import os;\n"
     "[open('inputs/s%d'%n,'wb').write(bytes(bytearray([1,1,6]+[0]*(n-3)))) for n in (16,20,22,23,28)]\""
 )
@@ -83,10 +88,33 @@ def _read_text(path: str) -> str:
         return f.read()
 
 
+def _synthesize_bootp_patch(prompt: str) -> str:
+    """Build the patch the LLM would have returned, from the vulnerable function embedded in
+    the patch prompt. Inserts the missing ``ND_TCHECK`` bound check before the first unchecked
+    ``EXTRACT_*BITS`` read so the spliced diff is minimal and real. Falls back to the bundled
+    bootp_patch.c when the prompt carries no usable function (e.g. the source was never read).
+    """
+    import patching  # shared extractor
+
+    func = patching.extract_c_code(prompt)
+    lines = func.split("\n")
+    for idx, ln in enumerate(lines):
+        if "EXTRACT_" in ln and "BITS" in ln and "ND_TCHECK" not in ln:
+            indent = ln[: len(ln) - len(ln.lstrip())]
+            guard = (
+                f"{indent}ND_TCHECK2(*bp, 2);  /* FIX: bound-check before the read */"
+            )
+            lines.insert(idx, guard)
+            return "\n".join(lines)
+    return _read_text(BOOTP_PATCH_C)
+
+
 # --------------------------------------------------------------------------- #
 # DAST fallback: build the known-good harness and fuzz for a real crash
 # --------------------------------------------------------------------------- #
-def fuzz_known_good_harness(task_id, repo_url, fuzz_timeout: int = FUZZ_TIMEOUT) -> bytes:
+def fuzz_known_good_harness(
+    task_id, repo_url, fuzz_timeout: int = FUZZ_TIMEOUT
+) -> bytes:
     """Build the AFL++ image, drop in the known-good bootp_print harness.c, build tcpdump
     + the harness, and fuzz until a real crash is produced. Returns the crash input bytes.
     Raises if the build or fuzzing cannot produce a crash.
@@ -94,18 +122,26 @@ def fuzz_known_good_harness(task_id, repo_url, fuzz_timeout: int = FUZZ_TIMEOUT)
     import tasks  # boundary helpers (notify_status, build_dynamic_fuzzing_env, copy_text_to_container)
 
     tasks.notify_status(
-        task_id, "DAST", "Running",
+        task_id,
+        "DAST",
+        "Running",
         "LLM harness did not build; switching to the known-good bootp_print harness.c and fuzzing for real.",
     )
 
     build_res = tasks.build_dynamic_fuzzing_env(repo_url, task_id)
     if build_res.get("status") == "Failed":
-        raise Exception(f"debug fallback: fuzzing image build failed: {build_res.get('error')}")
+        raise Exception(
+            f"debug fallback: fuzzing image build failed: {build_res.get('error')}"
+        )
     image_name = build_res["image"]
 
     client = docker.from_env()
     container = client.containers.run(
-        image_name, command="tail -f /dev/null", detach=True, working_dir="/target", privileged=True,
+        image_name,
+        command="tail -f /dev/null",
+        detach=True,
+        working_dir="/target",
+        privileged=True,
     )
     try:
         container.reload()
@@ -113,16 +149,25 @@ def fuzz_known_good_harness(task_id, repo_url, fuzz_timeout: int = FUZZ_TIMEOUT)
             raise Exception("debug fallback: fuzzing container failed to start")
 
         # Inject the known-good harness (overwrites whatever the LLM produced).
-        tasks.copy_text_to_container(container, "/target", "harness.c", _read_text(HARNESS_C))
+        tasks.copy_text_to_container(
+            container, "/target", "harness.c", _read_text(HARNESS_C)
+        )
 
-        tasks.notify_status(task_id, "DAST", "Running",
-                            "Building tcpdump (libnetdissect.a) and compiling harness.c ...")
+        tasks.notify_status(
+            task_id,
+            "DAST",
+            "Running",
+            "Building tcpdump (libnetdissect.a) and compiling harness.c ...",
+        )
         res = container.exec_run(["sh", "-c", _BUILD_HARNESS_CMD], user="root")
         if res.exit_code != 0:
             logs = container.exec_run(
-                "sh -c 'tail -n 25 /tmp/cc.log /tmp/make.log /tmp/cfg.log 2>/dev/null'", user="root"
+                "sh -c 'tail -n 25 /tmp/cc.log /tmp/make.log /tmp/cfg.log 2>/dev/null'",
+                user="root",
             ).output.decode("utf-8", "replace")
-            raise Exception(f"debug fallback: known-good harness build failed:\n{logs[-1500:]}")
+            raise Exception(
+                f"debug fallback: known-good harness build failed:\n{logs[-1500:]}"
+            )
 
         # Seed corpus of short, in-bounds packets (clean dry run, fast path to the OOB).
         container.exec_run(["sh", "-c", _SEED_CMD], user="root")
@@ -131,23 +176,50 @@ def fuzz_known_good_harness(task_id, repo_url, fuzz_timeout: int = FUZZ_TIMEOUT)
         # ASAN-nondeterministic forkserver-startup abort instead of failing the pipeline.
         for attempt in range(1, FUZZ_ATTEMPTS + 1):
             tasks.notify_status(
-                task_id, "DAST", "Running",
+                task_id,
+                "DAST",
+                "Running",
                 f"Fuzzing bootp_print with harness.c (attempt {attempt}/{FUZZ_ATTEMPTS}, up to {fuzz_timeout}s) ...",
             )
-            container.exec_run(["sh", "-c", _FUZZ_ONE_CMD.format(timeout=fuzz_timeout)], user="root")
-            ls = container.exec_run("sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root")
-            crash_files = ls.output.decode("utf-8", "replace").split() if ls.exit_code == 0 else []
+            container.exec_run(
+                ["sh", "-c", _FUZZ_ONE_CMD.format(timeout=fuzz_timeout)], user="root"
+            )
+            ls = container.exec_run(
+                "sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root"
+            )
+            crash_files = (
+                ls.output.decode("utf-8", "replace").split()
+                if ls.exit_code == 0
+                else []
+            )
             if crash_files:
-                crash_data = container.exec_run(["cat", crash_files[0]], user="root").output
-                tasks.notify_status(task_id, "DAST", "Success",
-                                    f"harness.c fuzzing found a real bootp_print crash ({len(crash_data)} bytes).")
+                crash_data = container.exec_run(
+                    ["cat", crash_files[0]], user="root"
+                ).output
+                tasks.notify_status(
+                    task_id,
+                    "DAST",
+                    "Success",
+                    f"harness.c fuzzing found a real bootp_print crash ({len(crash_data)} bytes).",
+                )
                 return crash_data
-            fs = container.exec_run("sh -c 'grep -c \"Fork server crashed\" /tmp/fuzz.log 2>/dev/null'", user="root")
-            tasks.notify_status(task_id, "DAST", "Warning",
-                                f"Fuzz attempt {attempt} produced no crash (forkserver_abort={fs.output.decode().strip()}); retrying.")
+            fs = container.exec_run(
+                "sh -c 'grep -c \"Fork server crashed\" /tmp/fuzz.log 2>/dev/null'",
+                user="root",
+            )
+            tasks.notify_status(
+                task_id,
+                "DAST",
+                "Warning",
+                f"Fuzz attempt {attempt} produced no crash (forkserver_abort={fs.output.decode().strip()}); retrying.",
+            )
 
-        tail = container.exec_run("sh -c 'tail -n 15 /tmp/fuzz.log 2>/dev/null'", user="root").output.decode("utf-8", "replace")
-        raise Exception(f"debug fallback: fuzzing produced no crash after {FUZZ_ATTEMPTS} attempts\n{tail[-1000:]}")
+        tail = container.exec_run(
+            "sh -c 'tail -n 15 /tmp/fuzz.log 2>/dev/null'", user="root"
+        ).output.decode("utf-8", "replace")
+        raise Exception(
+            f"debug fallback: fuzzing produced no crash after {FUZZ_ATTEMPTS} attempts\n{tail[-1000:]}"
+        )
     finally:
         try:
             container.stop(timeout=1)
@@ -179,13 +251,27 @@ def activate() -> None:
         try:
             return _orig_clone(task_id, repo_url, temp_dir)
         except Exception as e:
-            tasks.notify_status(task_id, "INIT", "Warning", f"git clone failed ({e}); continuing with tcpdump debug fallback.")
+            tasks.notify_status(
+                task_id,
+                "INIT",
+                "Warning",
+                f"git clone failed ({e}); continuing with tcpdump debug fallback.",
+            )
 
-    def run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path):
+    def run_codeql_analysis(
+        task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path
+    ):
         try:
-            return _orig_codeql(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path)
+            return _orig_codeql(
+                task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path
+            )
         except Exception as e:
-            tasks.notify_status(task_id, "SAST", "Warning", f"CodeQL failed ({e}); using real tcpdump bootp_sa.sarif.")
+            tasks.notify_status(
+                task_id,
+                "SAST",
+                "Warning",
+                f"CodeQL failed ({e}); using real tcpdump bootp_sa.sarif.",
+            )
             shutil.copyfile(BOOTP_SARIF, sarif_path)
 
     def run_dast_fuzzing(task_id, repo_url, repo_path, harness_code, harness_path):
@@ -194,7 +280,9 @@ def activate() -> None:
         except Exception as e:
             # LLM harness failed to build/fuzz -> fall back to the known-good harness.c and
             # fuzz for real (no canned crash).
-            tasks.notify_status(task_id, "DAST", "Warning", f"LLM-harness DAST failed ({e}).")
+            tasks.notify_status(
+                task_id, "DAST", "Warning", f"LLM-harness DAST failed ({e})."
+            )
             return fuzz_known_good_harness(task_id, repo_url)
 
     def call_llm_api(prompt, model="gemini-2.5-flash", task_type=None):
@@ -203,11 +291,18 @@ def activate() -> None:
         except Exception as e:
             resp = f"ERROR: {e}"
         if not resp or resp.startswith("ERROR"):
-            if task_type == "harness" or "Write a complete C harness" in prompt or "Fix the errors based on the compiler output" in prompt:
+            if (
+                task_type == "harness"
+                or "Write a complete C harness" in prompt
+                or "Fix the errors based on the compiler output" in prompt
+            ):
                 return _read_text(HARNESS_C)
-            if task_type == "patch" or "Fix the vulnerability in this code" in prompt:
-                return _read_text(MOCK_PATCH_C)
-            if task_type == "docker_deps" or "configuring an AFL++ fuzzing environment" in prompt:
+            if task_type == "patch" or "Patch ONLY the function below" in prompt:
+                return _synthesize_bootp_patch(prompt)
+            if (
+                task_type == "docker_deps"
+                or "configuring an AFL++ fuzzing environment" in prompt
+            ):
                 # Default apt deps for building tcpdump-4.9.1 (libpcap + openssl/crypto).
                 return "libpcap-dev libssl-dev pkg-config zlib1g-dev"
         return resp

@@ -1,5 +1,7 @@
 from celery import Celery
 import collections
+import queue
+import threading
 import time
 import tempfile
 import shutil
@@ -47,6 +49,41 @@ celery_app = Celery(
     broker=os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0"),
     backend=os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0"),
 )
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+ALLOWED_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+]
+DEV_LLM_CONFIG_KEY = "dev:llm_config"
+SAMPLE_REPOS = {
+    "sample://buffer-overflow": {
+        "name": "Buffer Overflow Sample",
+        "description": "Tiny C project with argv/input taint reaching strcpy.",
+        "path": os.path.join(_BACKEND_DIR, "debug_samples", "buffer_overflow_repo"),
+    }
+}
+
+
+class PipelineUserError(RuntimeError):
+    def __init__(self, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.hint = hint
+
+
+def is_sample_repo_url(repo_url: str) -> bool:
+    return repo_url in SAMPLE_REPOS
+
+
+def copy_sample_repo(repo_url: str, target_dir: str):
+    sample = SAMPLE_REPOS.get(repo_url)
+    if not sample:
+        raise ValueError(f"Unknown sample repository: {repo_url}")
+    sample_path = sample["path"]
+    if not os.path.isdir(sample_path):
+        raise FileNotFoundError(f"Sample repository is missing: {sample_path}")
+    shutil.copytree(sample_path, target_dir, dirs_exist_ok=True)
 
 
 def notify_status(task_id, step, status, details=None, extra=None):
@@ -254,6 +291,16 @@ def _extract_call_path(
 
 def clone_repo(task_id, repo_url, temp_dir):
     """Shallow-clone the target repository into temp_dir. Raises on failure."""
+    if is_sample_repo_url(repo_url):
+        notify_status(
+            task_id,
+            "INIT",
+            "Running",
+            f"Loading internal sample repository {repo_url}",
+        )
+        copy_sample_repo(repo_url, temp_dir)
+        return
+
     subprocess.run(
         ["git", "clone", "--depth", "1", repo_url, temp_dir],
         capture_output=True,
@@ -270,17 +317,68 @@ def run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_
     # subdirectories of the same pack so each CodeQL pass runs only its own queries.
     vuln_queries_dir = os.path.join(queries_dir, "vulnerabilities")
     callgraph_queries_dir = os.path.join(queries_dir, "callgraph")
+    codeql_threads = os.environ.get("CODEQL_THREADS", "1")
+    codeql_ram_mb = os.environ.get("CODEQL_RAM_MB", "2048")
 
     def run_codeql_streaming(cmd):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
-        for line in proc.stdout:
+
+        lines = queue.Queue()
+
+        def read_stdout():
+            try:
+                for raw_line in proc.stdout:
+                    lines.put(raw_line)
+            finally:
+                lines.put(None)
+
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
+
+        started_at = time.time()
+        last_output_at = started_at
+        last_heartbeat_at = started_at
+        command_name = " ".join(cmd[:3])
+
+        while True:
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                line = None
+
+            if line is None:
+                if proc.poll() is not None:
+                    break
+                now = time.time()
+                if now - last_heartbeat_at >= 15:
+                    elapsed = int(now - started_at)
+                    quiet_for = int(now - last_output_at)
+                    notify_status(
+                        task_id,
+                        "SAST",
+                        "Running",
+                        f"{command_name} still running... elapsed={elapsed}s, no new CodeQL output for {quiet_for}s",
+                    )
+                    last_heartbeat_at = now
+                continue
+
             line = line.rstrip()
             if line:
                 notify_status(task_id, "SAST", "Running", line)
+                last_output_at = time.time()
+                last_heartbeat_at = last_output_at
+
         proc.wait()
         if proc.returncode != 0:
+            if proc.returncode == 137:
+                raise PipelineUserError(
+                    "CodeQL was killed with exit status 137, which usually means the "
+                    "container or WSL host ran out of memory.",
+                    "Lower CODEQL_RAM_MB/CODEQL_THREADS, increase Docker/WSL memory, "
+                    "or use a lighter dev CodeQL query for sample runs.",
+                )
             raise subprocess.CalledProcessError(proc.returncode, cmd)
 
     run_codeql_streaming(
@@ -315,6 +413,8 @@ def run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_
             db_path,
             vuln_queries_dir,
             "--search-path=/opt/codeql/qlpacks",
+            f"--threads={codeql_threads}",
+            f"--ram={codeql_ram_mb}",
             "--format=sarif-latest",
             f"--output={sarif_path}",
         ]
@@ -330,6 +430,8 @@ def run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_
                 db_path,
                 callgraph_queries_dir,
                 "--search-path=/opt/codeql/qlpacks",
+                f"--threads={codeql_threads}",
+                f"--ram={codeql_ram_mb}",
                 "--format=sarif-latest",
                 f"--output={callgraph_sarif_path}",
             ]
@@ -799,7 +901,10 @@ def _run_pipeline_impl(task_id: str, repo_url: str):
         return {"status": "Complete", "repo": repo_url, "patch_generated": True}
 
     except Exception as e:
-        notify_status(task_id, "PIPELINE", "Failed", str(e))
+        extra = None
+        if isinstance(e, PipelineUserError):
+            extra = {"error_hint": e.hint}
+        notify_status(task_id, "PIPELINE", "Failed", str(e), extra=extra)
         try:
             from database import SessionLocal
             from models import Job as JobModel
@@ -843,8 +948,29 @@ def extract_c_code(llm_response):
     return llm_response.strip()
 
 
+def _get_dev_llm_config() -> dict:
+    try:
+        raw = redis_client.get(DEV_LLM_CONFIG_KEY)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def call_llm_api(prompt, model="gemini-2.5-flash", task_type=None):
-    if os.environ.get("DEBUG_BYPASS_LLM", "False").lower() in ("true", "1", "yes"):
+    dev_config = _get_dev_llm_config()
+    bypass_llm = (
+        os.environ.get("DEBUG_BYPASS_LLM", "False").lower() in ("true", "1", "yes")
+        or str(dev_config.get("bypass_llm", "False")).lower() in ("true", "1", "yes")
+    )
+    if bypass_llm:
         debug_assets_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "debug_assets"
         )
@@ -872,13 +998,17 @@ def call_llm_api(prompt, model="gemini-2.5-flash", task_type=None):
                     return f.read()
             return "pkg-config libssl-dev zlib1g-dev"
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    selected_model = dev_config.get("model") or os.environ.get("GEMINI_MODEL") or model
+    if selected_model not in ALLOWED_GEMINI_MODELS:
+        selected_model = model if model in ALLOWED_GEMINI_MODELS else DEFAULT_GEMINI_MODEL
+
+    api_key = dev_config.get("api_key") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return "ERROR: GEMINI_API_KEY not set"
     client = genai.Client(api_key=api_key)
     try:
         response = client.models.generate_content(
-            model=model,
+            model=selected_model,
             contents=prompt,
         )
         text = response.text
@@ -909,18 +1039,28 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
 
     # 1. Target Analysis & Build Context Setup
     build_dir = tempfile.mkdtemp(prefix="docker_build_")
-    try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, build_dir],
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        notify_status(
-            task_id, "ENV_GEN", "Failed", f"Failed to clone repository: {e.stderr}"
-        )
-        shutil.rmtree(build_dir, ignore_errors=True)
-        return {"status": "Failed", "error": f"Clone failed: {e.stderr}"}
+    if is_sample_repo_url(repo_url):
+        try:
+            copy_sample_repo(repo_url, build_dir)
+        except Exception as e:
+            notify_status(
+                task_id, "ENV_GEN", "Failed", f"Failed to load sample repository: {e}"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            return {"status": "Failed", "error": f"Sample load failed: {e}"}
+    else:
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url, build_dir],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            notify_status(
+                task_id, "ENV_GEN", "Failed", f"Failed to clone repository: {e.stderr}"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            return {"status": "Failed", "error": f"Clone failed: {e.stderr}"}
 
     build_context = ""
     critical_files = [
@@ -969,7 +1109,10 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
         )
 
         # 2. Dependency Resolution via LLM
-        prompt = f"""
+        if is_sample_repo_url(repo_url):
+            llm_response = "pkg-config"
+        else:
+            prompt = f"""
 You are an expert DevSecOps engineer configuring an AFL++ fuzzing environment on Ubuntu 22.04.
 Analyze the target repository's build files and determine its system dependencies (e.g., libpcap-dev, libssl-dev, pkg-config).
 
@@ -981,12 +1124,12 @@ Output ONLY a space-separated list of required Ubuntu `apt` packages.
 DO NOT include commands like `apt-get install` or any markdown formatting.
 Just the package names, for example: pkg-config libssl-dev zlib1g-dev
 """
-        if feedback_context:
-            prompt += "\n\nPrevious build attempts failed with these errors. Please fix/add the missing dependencies:\n"
-            for fb in feedback_context:
-                prompt += f"{fb}\n"
+            if feedback_context:
+                prompt += "\n\nPrevious build attempts failed with these errors. Please fix/add the missing dependencies:\n"
+                for fb in feedback_context:
+                    prompt += f"{fb}\n"
 
-        llm_response = call_llm_api(prompt, task_type="docker_deps")
+            llm_response = call_llm_api(prompt, task_type="docker_deps")
 
         # Clean the response to ensure only space-separated packages are present
         target_deps = (

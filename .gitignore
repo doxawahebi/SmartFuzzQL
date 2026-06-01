@@ -39,6 +39,9 @@ vulnerability_report.json
 
 #
 TODO.md
+docs/proposal_local.md
 
 tcpdump-tcpdump-4.9.1/
 libpcap-1.8.0/
+.env
+.claude/settings.local.json

@@ -6,6 +6,8 @@ import 'reactflow/dist/style.css';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import Editor from '@monaco-editor/react';
 
+const DEV_REPO_URL_KEY = 'smartfuzzql.dev.repoUrl';
+
 const initialNodes = [
   { id: '1', position: { x: 50,   y: 100 }, data: { label: 'Job Submission' }, type: 'input' },
   { id: '2', position: { x: 250,  y: 100 }, data: { label: 'SAST (CodeQL)' } },
@@ -28,12 +30,13 @@ const initialEdges = [
 const Dashboard = () => {
   const [nodes, setNodes] = useState(initialNodes);
   const [edges, setEdges] = useState(initialEdges);
-  const [repoUrl, setRepoUrl] = useState("");
+  const [repoUrl, setRepoUrl] = useState(() => localStorage.getItem(DEV_REPO_URL_KEY) ?? "");
   const [logs, setLogs] = useState([]);
   const [vulnData, setVulnData] = useState(null);
   const [pipelineResult, setPipelineResult] = useState(null);
   const [fuzzStats, setFuzzStats] = useState([]);
   const [taskId, setTaskId] = useState(null);
+  const [pipelineError, setPipelineError] = useState(null);
 
   const nodeMap = {
     "INIT":       "1",
@@ -81,6 +84,16 @@ const Dashboard = () => {
 
           const logLine = `[${data.step}] ${data.status} - ${data.details}`;
           setLogs((prev) => [...prev, logLine]);
+          if (data.status === 'Failed') {
+            setPipelineError({
+              step: data.step,
+              message: data.details,
+              hint: data.error_hint ?? null,
+            });
+            if (data.error_hint) {
+              setLogs((prev) => [...prev, `[HINT] ${data.error_hint}`]);
+            }
+          }
 
           const nodeId = nodeMap[data.step];
           if (nodeId) {
@@ -135,6 +148,7 @@ const Dashboard = () => {
     setPipelineResult(null);
     setFuzzStats([]);
     setTaskId(null);
+    setPipelineError(null);
     taskIdRef.current = null;
     try {
       const apiHost = window.location.hostname;
@@ -166,9 +180,14 @@ const Dashboard = () => {
     <div className="flex flex-col h-screen bg-gray-900 text-white p-4 font-sans">
       <div className="flex items-center justify-between">
         <Breadcrumb />
-        <Link to="/admin/dashboard" className="text-xs text-gray-400 hover:text-blue-400 transition-colors">
-          Admin →
-        </Link>
+        <div className="flex items-center gap-3 text-xs">
+          <Link to="/dev/lab" className="text-gray-400 hover:text-blue-400 transition-colors">
+            Developer Lab
+          </Link>
+          <Link to="/admin/dashboard" className="text-gray-400 hover:text-blue-400 transition-colors">
+            Admin
+          </Link>
+        </div>
       </div>
       <h1 className="text-3xl font-bold mb-4 mt-1">HAST Full-Stack Dashboard</h1>
 
@@ -177,7 +196,15 @@ const Dashboard = () => {
           className="flex-1 p-2 bg-gray-800 border border-gray-700 rounded"
           placeholder="GitHub URL or Source Code"
           value={repoUrl}
-          onChange={(e) => setRepoUrl(e.target.value)}
+          onChange={(e) => {
+            const nextRepoUrl = e.target.value;
+            if (nextRepoUrl.startsWith('sample://')) {
+              localStorage.setItem(DEV_REPO_URL_KEY, nextRepoUrl);
+            } else {
+              localStorage.removeItem(DEV_REPO_URL_KEY);
+            }
+            setRepoUrl(nextRepoUrl);
+          }}
         />
         <button
           className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold"
@@ -211,6 +238,22 @@ const Dashboard = () => {
               </LineChart>
             </ResponsiveContainer>
           </div>
+
+          {pipelineError && (
+            <div className="bg-red-950 border border-red-700 rounded p-3 text-sm">
+              <h2 className="text-lg font-semibold mb-2 text-red-200">Pipeline Failed</h2>
+              <div>
+                <span className="text-red-300">Step: </span>
+                <span className="text-white">{pipelineError.step}</span>
+              </div>
+              <div className="mt-1 text-red-100">{pipelineError.message}</div>
+              {pipelineError.hint && (
+                <div className="mt-2 bg-red-900/60 border border-red-800 rounded p-2 text-red-100">
+                  {pipelineError.hint}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Vulnerability Panel */}
           <div className="bg-gray-800 rounded border border-gray-700 p-3">

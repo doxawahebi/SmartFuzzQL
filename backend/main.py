@@ -15,7 +15,13 @@ import database
 import models
 from database import SessionLocal, get_db
 from models import Job
-from tasks import run_pipeline
+from tasks import (
+    ALLOWED_GEMINI_MODELS,
+    DEFAULT_GEMINI_MODEL,
+    DEV_LLM_CONFIG_KEY,
+    SAMPLE_REPOS,
+    run_pipeline,
+)
 
 app = FastAPI(title="HAST Pipeline API")
 
@@ -64,6 +70,33 @@ class JobStatusResponse(BaseModel):
     state: str
     vuln: VulnFinding | None = None
     result: PipelineResult | None = None
+
+
+class DevLlmSettingsRequest(BaseModel):
+    model: str = DEFAULT_GEMINI_MODEL
+    api_key: str | None = None
+    clear_api_key: bool = False
+    bypass_llm: bool = False
+
+
+class DevLlmSettingsResponse(BaseModel):
+    model: str
+    api_key_set: bool
+    api_key_source: str | None = None
+    bypass_llm: bool = False
+
+
+class DevSampleRepo(BaseModel):
+    url: str
+    name: str
+    description: str
+
+
+class DevOptionsResponse(BaseModel):
+    models: list[str]
+    default_model: str
+    llm: DevLlmSettingsResponse
+    sample_repos: list[DevSampleRepo]
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +343,73 @@ async def redis_listener():
                 await app.state.pubsub.subscribe("pipeline_logs")
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Developer lab API
+# ---------------------------------------------------------------------------
+
+async def _read_dev_llm_config() -> dict:
+    try:
+        raw = await app.state.redis.get(DEV_LLM_CONFIG_KEY)
+    except Exception:
+        raw = None
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return {}
+
+
+def _dev_llm_response(config: dict) -> DevLlmSettingsResponse:
+    model = config.get("model") or os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    if model not in ALLOWED_GEMINI_MODELS:
+        model = DEFAULT_GEMINI_MODEL
+    redis_key_set = bool(config.get("api_key"))
+    env_key_set = bool(os.environ.get("GEMINI_API_KEY"))
+    return DevLlmSettingsResponse(
+        model=model,
+        api_key_set=redis_key_set or env_key_set,
+        api_key_source="dev" if redis_key_set else ("env" if env_key_set else None),
+        bypass_llm=bool(config.get("bypass_llm", False)),
+    )
+
+
+@app.get("/api/dev/options", response_model=DevOptionsResponse)
+async def get_dev_options():
+    config = await _read_dev_llm_config()
+    samples = [
+        DevSampleRepo(
+            url=url,
+            name=meta["name"],
+            description=meta["description"],
+        )
+        for url, meta in SAMPLE_REPOS.items()
+    ]
+    return DevOptionsResponse(
+        models=ALLOWED_GEMINI_MODELS,
+        default_model=DEFAULT_GEMINI_MODEL,
+        llm=_dev_llm_response(config),
+        sample_repos=samples,
+    )
+
+
+@app.post("/api/dev/llm-settings", response_model=DevLlmSettingsResponse)
+async def update_dev_llm_settings(settings: DevLlmSettingsRequest):
+    if settings.model not in ALLOWED_GEMINI_MODELS:
+        raise HTTPException(status_code=400, detail="Unsupported Gemini model")
+
+    config = await _read_dev_llm_config()
+    config["model"] = settings.model
+    config["bypass_llm"] = settings.bypass_llm
+    if settings.clear_api_key:
+        config.pop("api_key", None)
+    elif settings.api_key:
+        config["api_key"] = settings.api_key.strip()
+
+    await app.state.redis.set(DEV_LLM_CONFIG_KEY, json.dumps(config))
+    return _dev_llm_response(config)
 
 
 # ---------------------------------------------------------------------------

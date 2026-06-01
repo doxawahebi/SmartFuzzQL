@@ -5,6 +5,8 @@ const LABELS = {
   dashboard: 'Dashboard',
   report: 'Report',
   admin: 'Admin',
+  dev: 'Developer',
+  lab: 'Lab',
 };
 
 const Breadcrumb = () => {
@@ -14,7 +16,7 @@ const Breadcrumb = () => {
   const crumbs = [{ label: 'SmartFuzzQL', to: '/', isLast: false }];
   segments.forEach((seg, i) => {
     const to = '/' + segments.slice(0, i + 1).join('/');
-    const label = LABELS[seg] ?? (seg.length > 8 ? seg.slice(0, 8) + '…' : seg);
+    const label = LABELS[seg] ?? (seg.length > 8 ? `${seg.slice(0, 8)}...` : seg);
     crumbs.push({ label, to, isLast: i === segments.length - 1 });
   });
 

@@ -111,6 +111,8 @@ Both `pipeline.py` and `backend/tasks.py` call Gemini via `google-genai`. The mo
 | `CELERY_RESULT_BACKEND` | web, worker | Redis URL |
 | `DATABASE_URL` | web, worker | PostgreSQL connection string |
 | `DEBUG_BYPASS_LLM` | worker | Set `True` to skip Gemini and use fixture files |
+| `DEBUG_TEST_TCPDUMP` | worker | Set `True` to verify the full tcpdump-4.9.1 flow end-to-end: every real stage still runs, but a mock falls back on failure so the job always reaches a SUCCESS `bootp_print` report. Independent of `DEBUG_BYPASS_LLM`. |
+| `TCPDUMP_CRASH_DIR` | worker | Optional override for the directory holding the real crash pcaps (`harnss_crash.pcap`, `origin_crash.pcap`); defaults to `backend/debug_assets`. |
 
 ## Commands (Quick Reference)
 

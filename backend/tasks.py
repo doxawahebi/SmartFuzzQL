@@ -13,8 +13,27 @@ import subprocess
 import docker
 import requests
 import io
+import sys
 import tarfile
 from datetime import datetime
+
+# Ensure this backend directory is importable by absolute path. The Celery worker's
+# sys.path[0] is '' (relative to cwd), so the lazy `from database import ...` /
+# `from models import ...` in run_pipeline can fail with ModuleNotFoundError once the
+# working directory changes during a job. Pinning the dir keeps those imports reliable.
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+# Pre-load the DB modules in the worker MainProcess so they live in sys.modules and the
+# lazy `from database import ...` inside the task is fully independent of cwd/sys.path in
+# forked children. Guarded so tasks.py still imports where the DB stack is unavailable
+# (e.g. unit tests without psycopg2).
+try:  # noqa: SIM105
+    import database  # noqa: F401
+    import models  # noqa: F401
+except Exception:
+    pass
 
 console = Console()
 redis_client = redis.Redis.from_url(os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
@@ -206,173 +225,59 @@ def _extract_call_path(
     return _call_path_from_chain(chain, locs)
 
 
-@celery_app.task(bind=True)
-def run_pipeline(self, repo_url: str):
-    task_id = self.request.id
-    temp_dir = tempfile.mkdtemp(prefix=f"pipeline_run_{task_id}_")
-    console.print(f"temp_dir : {temp_dir}")
+def clone_repo(task_id, repo_url, temp_dir):
+    """Shallow-clone the target repository into temp_dir. Raises on failure."""
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], capture_output=True, check=True)
+
+
+def run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path):
+    """Run the two CodeQL passes: write the vulnerability SARIF to sarif_path and the
+    best-effort call-graph SARIF to callgraph_sarif_path. Raises if the vulnerability pass
+    cannot run (e.g. the CodeQL CLI is missing)."""
+    queries_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
+    # Vulnerability-finding queries and the call-graph query live in separate
+    # subdirectories of the same pack so each CodeQL pass runs only its own queries.
+    vuln_queries_dir = os.path.join(queries_dir, "vulnerabilities")
+    callgraph_queries_dir = os.path.join(queries_dir, "callgraph")
+
+    def run_codeql_streaming(cmd):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                notify_status(task_id, "SAST", "Running", line)
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+    run_codeql_streaming(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--build-mode=none"])
+    # Resolve query dependencies (codeql/cpp-all powers the DataFlow taint query).
+    # Best-effort: if the worker is offline but the lib pack is already on the search
+    # path, the analyze step below still succeeds.
+    try:
+        run_codeql_streaming(["codeql", "pack", "install", queries_dir])
+    except subprocess.CalledProcessError as e:
+        notify_status(task_id, "SAST", "Warning", f"codeql pack install failed; relying on --search-path: {e}")
+    # Pass 1 - vulnerability-finding queries only (taint + structural). Raises on failure.
+    run_codeql_streaming(["codeql", "database", "analyze", db_path, vuln_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
+    # Pass 2 - call-graph reachability. Supplementary: a failure here must not abort the
+    # pipeline, so it runs after the vuln pass and swallows errors.
+    try:
+        run_codeql_streaming(["codeql", "database", "analyze", db_path, callgraph_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={callgraph_sarif_path}"])
+    except Exception as e:
+        notify_status(task_id, "SAST", "Warning", f"Call-graph analysis skipped: {e}")
+
+
+def run_dast_fuzzing(task_id, repo_url, repo_path, harness_code, harness_path):
+    """Build a per-job fuzzing image, compile the harness (LLM feedback loop), fuzz with
+    AFL++, and return the crash input bytes. Raises on build/compile failure or timeout."""
     docker_client = docker.from_env()
     container = None
-    
     try:
-        notify_status(task_id, "INIT", "Running", f"Starting pipeline for {repo_url} in {temp_dir}")
-        subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], capture_output=True, check=True)
-        repo_path = temp_dir
-        
-        # Step 1: SAST (CodeQL)
-        notify_status(task_id, "SAST", "Running", "Cloning and extracting source-level logical vulnerabilities via CodeQL")
-        db_path = os.path.join(temp_dir, "my-db")
-        sarif_path = os.path.join(temp_dir, "results.sarif")
-        callgraph_sarif_path = os.path.join(temp_dir, "callgraph.sarif")
-
-        # For this prototype we assume codeql is locally installed and available via CLI, or use a prebuilt container
-        # Since codeql is large, relying on local setup or a specific pipeline config.
-        # Fallback: if codeql missing, mock the SARIF finding for demonstration of full flow.
-        queries_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
-        # Vulnerability-finding queries and the call-graph query live in separate
-        # subdirectories of the same pack so each CodeQL pass runs only its own queries.
-        vuln_queries_dir = os.path.join(queries_dir, "vulnerabilities")
-        callgraph_queries_dir = os.path.join(queries_dir, "callgraph")
-
-        def run_codeql_streaming(cmd):
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    notify_status(task_id, "SAST", "Running", line)
-            proc.wait()
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(proc.returncode, cmd)
-        try:
-           run_codeql_streaming(["codeql", "database", "create", db_path, "--language=cpp", f"--source-root={temp_dir}", "--build-mode=none"])
-           # Resolve query dependencies (codeql/cpp-all powers the DataFlow taint query).
-           # Best-effort: if the worker is offline but the lib pack is already on the
-           # search path, the analyze step below still succeeds.
-           try:
-               run_codeql_streaming(["codeql", "pack", "install", queries_dir])
-           except subprocess.CalledProcessError as e:
-               notify_status(task_id, "SAST", "Warning", f"codeql pack install failed; relying on --search-path: {e}")
-           # Pass 1 — vulnerability-finding queries only (taint + structural).
-           run_codeql_streaming(["codeql", "database", "analyze", db_path, vuln_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={sarif_path}"])
-        except FileNotFoundError:
-           notify_status(task_id, "SAST", "Warning", "CodeQL CLI not found. Mocking SARIF for fuzzing step.")
-           uri = "src/main.c"
-           def _phys(line, col=1, endcol=1):
-               return {"physicalLocation": {"artifactLocation": {"uri": uri},
-                                            "region": {"startLine": line, "startColumn": col, "endColumn": endcol}}}
-           # Vulnerability SARIF (pass 1): a taint finding with a source -> sink path.
-           vuln_mock = {"runs": [{"results": [
-               {
-                   "ruleId": "cpp/taint-buffer-overflow",
-                   "message": {"text": "Potential buffer overflow"},
-                   "locations": [_phys(4, 5, 23)],
-                   "codeFlows": [{"threadFlows": [{"locations": [
-                       {"location": {"message": {"text": "input"}, **_phys(2, 30, 35)}},
-                       {"location": {"message": {"text": "strcpy(buf, input)"}, **_phys(4, 5, 23)}},
-                   ]}]}],
-               },
-           ]}]}
-           # Call-graph SARIF (pass 2): edges consumed by _extract_call_path.
-           callgraph_mock = {"runs": [{"results": [
-               {"ruleId": CALL_EDGE_RULE_ID,
-                "message": {"text": "CALL_EDGE main -> vulnerable_func"},
-                "locations": [_phys(7)]},
-               {"ruleId": CALL_EDGE_RULE_ID,
-                "message": {"text": "CALL_EDGE vulnerable_func -> strcpy"},
-                "locations": [_phys(4)]},
-           ]}]}
-           with open(sarif_path, "w") as f: json.dump(vuln_mock, f)
-           with open(callgraph_sarif_path, "w") as f: json.dump(callgraph_mock, f)
-           # Create a dummy src/main.c if it doesn't exist
-           os.makedirs(os.path.join(repo_path, "src"), exist_ok=True)
-           dummy_c = os.path.join(repo_path, "src", "main.c")
-           if not os.path.exists(dummy_c):
-               with open(dummy_c, "w") as f:
-                   f.write(
-                       "#include <string.h>\n"
-                       "void vulnerable_func(char *input) {\n"
-                       "    char buf[10];\n"
-                       "    strcpy(buf, input);\n"
-                       "}\n"
-                       "int main(int argc, char **argv) {\n"
-                       "    if (argc > 1) vulnerable_func(argv[1]);\n"
-                       "    return 0;\n"
-                       "}\n"
-                   )
-
-        # Pass 2 — call-graph reachability. Supplementary: a failure here must not
-        # abort the pipeline, so it runs outside the vuln pass and swallows errors.
-        try:
-            run_codeql_streaming(["codeql", "database", "analyze", db_path, callgraph_queries_dir, "--search-path=/opt/codeql/qlpacks", "--format=sarif-latest", f"--output={callgraph_sarif_path}"])
-        except FileNotFoundError:
-            pass  # CodeQL absent — callgraph.sarif was already mocked above.
-        except Exception as e:
-            notify_status(task_id, "SAST", "Warning", f"Call-graph analysis skipped: {e}")
-
-        with open(sarif_path, "r") as f:
-            sarif_data = json.load(f)
-
-        # Load call-graph edges from the separate pass (best-effort; may be absent).
-        call_edge_results = []
-        if os.path.exists(callgraph_sarif_path):
-            try:
-                with open(callgraph_sarif_path, "r") as f:
-                    call_edge_results = json.load(f).get("runs", [{}])[0].get("results", [])
-            except (json.JSONDecodeError, OSError) as e:
-                notify_status(task_id, "SAST", "Warning", f"Could not read call-graph SARIF: {e}")
-
-        vuln_msg = "Unknown vulnerability"
-        vuln_file = "unknown"
-        all_results = sarif_data.get("runs", [{}])[0].get("results", [])
-        # The vuln pass no longer emits call edges, but filter defensively in case the
-        # pack layout changes and both query sets land in one SARIF.
-        results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
-        console.print(f"results : {results}")
-        if results:
-            vuln_msg = results[0].get("message", {}).get("text", "")
-            console.print(f"vuln_msg : {vuln_msg}")
-            locations = results[0].get("locations", [])
-            console.print(f"locations : {locations}")
-            if locations:
-                vuln_file = locations[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
-
-        vuln_file_full = os.path.join(repo_path, vuln_file)
-        console.print(f"vuln_file_full: {vuln_file_full}")
-        # vuln_code = "Code not found"
-        vuln_code = "Code not found 243234234234234234"
-        if os.path.exists(vuln_file_full):
-             with open(vuln_file_full, "r") as f: vuln_code = f.read()
-        console.print(f"vuln_code : {vuln_code}")
-
-        notify_status(
-            task_id, "SAST", "Success",
-            f"Found vulnerability: {vuln_msg} in {vuln_file}",
-            extra={
-                "vuln": {
-                    "message": vuln_msg,
-                    "file": vuln_file,
-                    "code_snippet": vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None,
-                }
-            }
-        )
-
-        # Step 2: AI Harness Generation
-        notify_status(task_id, "AI_HARNESS", "Running", "Requesting source-code level C harness from LLM")
-        prompt = f"Write a complete C harness for AFL++ targeting this file: {vuln_file}. Vulnerability: {vuln_msg}\nSource Code:\n```c\n{vuln_code}\n```"
-        llm_resp = call_llm_api(prompt, model='gemini-2.5-flash', task_type='harness')
-        harness_code = extract_c_code(llm_resp) # need to add this helper
-        harness_path = os.path.join(repo_path, "harness.c")
-        console.print(f"harness_path : {harness_path}")
-        console.print(f"harness_code : {harness_code}")
-        with open(harness_path, "w") as f: f.write(harness_code)
-        
-        # Step 3: DAST (AFL++)
-        notify_status(task_id, "DAST", "Running", "Fuzzing via isolated container against generated harness (max 20 mins)")
-        
         # Call the existing dynamic builder (we invoke it inline because we need the image)
         build_res = build_dynamic_fuzzing_env(repo_url, task_id)
         if build_res["status"] == "Failed":
-             raise Exception(f"Failed to build fuzzer env: {build_res.get('error')}")
+            raise Exception(f"Failed to build fuzzer env: {build_res.get('error')}")
         image_name = build_res["image"]
 
         # Run container
@@ -383,17 +288,16 @@ def run_pipeline(self, repo_url: str):
             working_dir="/target",
             privileged=True,
         )
-        
-        # 409 error : Check if container is running
-        container.reload() 
-        console.print(f"Container status: {container.status}")
 
+        # 409 error : Check if container is running
+        container.reload()
+        console.print(f"Container status: {container.status}")
         if container.status != "running":
             console.print("Container logs:", container.logs().decode('utf-8'))
-            raise Exception("컨테이너가 정상적으로 실행되지 않았습니다.")
-        
+            raise Exception("\ucee8\ud14c\uc774\ub108\uac00 \uc815\uc0c1\uc801\uc73c\ub85c \uc2e4\ud589\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.")
+
         copy_text_to_container(container, "/target", "harness.c", harness_code)
-        
+
         # Compile harness with feedback loop
         compile_cmd = "afl-clang-fast -fsanitize=fuzzer,address -I/usr/local/include/afl++ -o fuzz_target harness.c"
         max_compile_retries = 3
@@ -412,7 +316,7 @@ def run_pipeline(self, repo_url: str):
             stdout_bytes, stderr_bytes = compile_res.output
             stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else "No STDOUT"
             stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else "No STDERR"
-            
+
             error_msg = (
                 f"Failed to compile harness!\n"
                 f"[Command]  {compile_cmd}\n"
@@ -426,15 +330,15 @@ def run_pipeline(self, repo_url: str):
 
             if attempt == max_compile_retries:
                 raise Exception(error_msg)
-            else:
-                notify_status(task_id, "DAST", "Warning", f"Compilation failed. Requesting quick fix from LLM...")
-                fix_prompt = f"The following C harness failed to compile. Fix the errors based on the compiler output and return only the corrected complete C code. Do not explain.\n\nCompiler Output:\n{stderr_str}\n\nBroken Harness:\n```c\n{harness_code}\n```"
-                fix_resp = call_llm_api(fix_prompt, model='gemini-2.5-flash', task_type='harness')
-                harness_code = extract_c_code(fix_resp)
-                
-                # Update the local file and container
-                with open(harness_path, "w") as f: f.write(harness_code)
-                copy_text_to_container(container, "/target", "harness.c", harness_code)
+            notify_status(task_id, "DAST", "Warning", "Compilation failed. Requesting quick fix from LLM...")
+            fix_prompt = f"The following C harness failed to compile. Fix the errors based on the compiler output and return only the corrected complete C code. Do not explain.\n\nCompiler Output:\n{stderr_str}\n\nBroken Harness:\n```c\n{harness_code}\n```"
+            fix_resp = call_llm_api(fix_prompt, model='gemini-2.5-flash', task_type='harness')
+            harness_code = extract_c_code(fix_resp)
+
+            # Update the local file and container
+            with open(harness_path, "w") as f:
+                f.write(harness_code)
+            copy_text_to_container(container, "/target", "harness.c", harness_code)
 
         if not compile_success:
             raise Exception("Failed to compile harness after maximum retries.")
@@ -450,22 +354,22 @@ def run_pipeline(self, repo_url: str):
         notify_status(task_id, "DAST", "Running", f"Starting AFL++ fuzzing... This may take up to {TIME_MINITUTE} minutes. Monitoring for crashes.")
         fuzz_cmd = "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
         container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
-        
+
         # Read the background process logs to verify it started correctly
         time.sleep(2)
         fuzzer_stdout = container.exec_run("cat fuzzer_stdout.log", user="root")
         fuzzer_stderr = container.exec_run("cat fuzzer_stderr.log", user="root")
         console.print(f"[DEBUG] AFL++ STDOUT:\n{fuzzer_stdout.output.decode('utf-8', errors='replace')}")
         console.print(f"[DEBUG] AFL++ STDERR:\n{fuzzer_stderr.output.decode('utf-8', errors='replace')}")
-        
+
         notify_status(task_id, "DAST", "Running", f"Fuzzer started. Polling for crashes every {POLL_INTERVAL} seconds...")
-        
-        # Poll for 20 minutes
+
+        # Poll for the configured timeout
         timeout = TIME_MINITUTE * 60
         start = time.time()
         crash_found = False
         crash_data = None
-        
+
         while time.time() - start < timeout:
             console.print(f"[DEBUG] Polling loop running... Elapsed: {time.time() - start:.1f}s")
             stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
@@ -502,21 +406,112 @@ def run_pipeline(self, repo_url: str):
             else:
                 # No stats file yet
                 console.print(f"[DEBUG] fuzzer_stats not found yet. Exit code: {stats.exit_code}")
-            
+
             crashes = container.exec_run("sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root")
             if crashes.exit_code == 0 and crashes.output.decode('utf-8').strip():
                 crash_found = True
                 crash_files = crashes.output.decode('utf-8').strip().split()
                 if crash_files:
-                     crash_content = container.exec_run(f"cat {crash_files[0]}", user="root")
-                     crash_data = crash_content.output
+                    crash_content = container.exec_run(f"cat {crash_files[0]}", user="root")
+                    crash_data = crash_content.output
                 notify_status(task_id, "DAST", "Success", "Crash found!")
                 break
-            time.sleep(POLL_INTERVAL) # Poll every POLL_INTERVAL seconds
-            
+            time.sleep(POLL_INTERVAL)
+
         if not crash_found:
             notify_status(task_id, "DAST", "Failed", "No crash found within timeout")
             raise Exception("Timeout reached without finding crash")
+        return crash_data
+    finally:
+        if container:
+            try:
+                container.stop(timeout=1)
+                container.remove(force=True)
+            except Exception as e:
+                console.print(f"[red]Failed to cleanup container: {e}[/red]")
+
+
+@celery_app.task(bind=True)
+def run_pipeline(self, repo_url: str):
+    return _run_pipeline_impl(self.request.id, repo_url)
+
+
+def _run_pipeline_impl(task_id: str, repo_url: str):
+    temp_dir = tempfile.mkdtemp(prefix=f"pipeline_run_{task_id}_")
+    console.print(f"temp_dir : {temp_dir}")
+    try:
+        notify_status(task_id, "INIT", "Running", f"Starting pipeline for {repo_url} in {temp_dir}")
+        clone_repo(task_id, repo_url, temp_dir)
+        repo_path = temp_dir
+
+        # Step 1: SAST (CodeQL)
+        notify_status(task_id, "SAST", "Running", "Cloning and extracting source-level logical vulnerabilities via CodeQL")
+        db_path = os.path.join(temp_dir, "my-db")
+        sarif_path = os.path.join(temp_dir, "results.sarif")
+        callgraph_sarif_path = os.path.join(temp_dir, "callgraph.sarif")
+        run_codeql_analysis(task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path)
+
+        with open(sarif_path, "r") as f:
+            sarif_data = json.load(f)
+
+        # Load call-graph edges from the separate pass (best-effort; may be absent).
+        call_edge_results = []
+        if os.path.exists(callgraph_sarif_path):
+            try:
+                with open(callgraph_sarif_path, "r") as f:
+                    call_edge_results = json.load(f).get("runs", [{}])[0].get("results", [])
+            except (json.JSONDecodeError, OSError) as e:
+                notify_status(task_id, "SAST", "Warning", f"Could not read call-graph SARIF: {e}")
+
+        vuln_msg = "Unknown vulnerability"
+        vuln_file = "unknown"
+        all_results = sarif_data.get("runs", [{}])[0].get("results", [])
+        # The vuln pass no longer emits call edges, but filter defensively in case the
+        # pack layout changes and both query sets land in one SARIF.
+        results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
+        console.print(f"results : {results}")
+        if results:
+            vuln_msg = results[0].get("message", {}).get("text", "")
+            console.print(f"vuln_msg : {vuln_msg}")
+            locations = results[0].get("locations", [])
+            console.print(f"locations : {locations}")
+            if locations:
+                vuln_file = locations[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+
+        vuln_file_full = os.path.join(repo_path, vuln_file)
+        console.print(f"vuln_file_full: {vuln_file_full}")
+        vuln_code = "Code not found 243234234234234234"
+        if os.path.exists(vuln_file_full):
+            with open(vuln_file_full, "r") as f:
+                vuln_code = f.read()
+        console.print(f"vuln_code : {vuln_code}")
+
+        notify_status(
+            task_id, "SAST", "Success",
+            f"Found vulnerability: {vuln_msg} in {vuln_file}",
+            extra={
+                "vuln": {
+                    "message": vuln_msg,
+                    "file": vuln_file,
+                    "code_snippet": vuln_code[:500] if vuln_code != "Code not found 243234234234234234" else None,
+                }
+            }
+        )
+
+        # Step 2: AI Harness Generation
+        notify_status(task_id, "AI_HARNESS", "Running", "Requesting source-code level C harness from LLM")
+        prompt = f"Write a complete C harness for AFL++ targeting this file: {vuln_file}. Vulnerability: {vuln_msg}\nSource Code:\n```c\n{vuln_code}\n```"
+        llm_resp = call_llm_api(prompt, model='gemini-2.5-flash', task_type='harness')
+        harness_code = extract_c_code(llm_resp)
+        harness_path = os.path.join(repo_path, "harness.c")
+        console.print(f"harness_path : {harness_path}")
+        console.print(f"harness_code : {harness_code}")
+        with open(harness_path, "w") as f:
+            f.write(harness_code)
+
+        # Step 3: DAST (AFL++)
+        notify_status(task_id, "DAST", "Running", "Fuzzing via isolated container against generated harness (max 20 mins)")
+        crash_data = run_dast_fuzzing(task_id, repo_url, repo_path, harness_code, harness_path)
 
         # Step 4: AI Patch Generation
         notify_status(task_id, "AI_PATCH", "Running", "Crash verified. Querying LLM for source-code secure patch")
@@ -524,8 +519,9 @@ def run_pipeline(self, repo_url: str):
         patch_resp = call_llm_api(patch_prompt, model='gemini-2.5-flash', task_type='patch')
         patch_code = extract_c_code(patch_resp)
         patch_path = os.path.join(repo_path, "patched_" + os.path.basename(vuln_file))
-        with open(patch_path, "w") as f: f.write(patch_code)
-        
+        with open(patch_path, "w") as f:
+            f.write(patch_code)
+
         # Step 5: DB Storage
         notify_status(task_id, "DB_STORAGE", "Running", "Storing vulnerability, harness, fuzzer trace, and patches in PostgreSQL")
         try:
@@ -559,8 +555,8 @@ def run_pipeline(self, repo_url: str):
                 notify_status(task_id, "DB_STORAGE", "Warning", f"DB write failed: {db_err}")
             finally:
                 db.close()
-        except ImportError:
-            notify_status(task_id, "DB_STORAGE", "Warning", "Database module unavailable, skipping storage")
+        except ImportError as imp_err:
+            notify_status(task_id, "DB_STORAGE", "Warning", f"Database module unavailable, skipping storage: {imp_err!r}")
 
         notify_status(
             task_id, "PIPELINE", "Success",
@@ -577,7 +573,7 @@ def run_pipeline(self, repo_url: str):
             }
         )
         return {"status": "Complete", "repo": repo_url, "patch_generated": True}
-        
+
     except Exception as e:
         notify_status(task_id, "PIPELINE", "Failed", str(e))
         try:
@@ -598,13 +594,6 @@ def run_pipeline(self, repo_url: str):
             pass
         raise e
     finally:
-        # Cleanup
-        if container:
-            try:
-                container.stop(timeout=1)
-                container.remove(force=True)
-            except Exception as e:
-                console.print(f"[red]Failed to cleanup container: {e}[/red]")
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 def extract_c_code(llm_response):

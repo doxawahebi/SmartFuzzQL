@@ -18,7 +18,9 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A tasks.celery_app worker --loglevel=info
+    # --include=debug_tcpdump activates the DEBUG_TEST_TCPDUMP resilience mode (a no-op
+    # unless that env var is True); it monkeypatches tasks.py boundaries from outside.
+    command: celery -A tasks.celery_app worker --loglevel=info --include=debug_tcpdump
     volumes:
       - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock
@@ -32,6 +34,10 @@ services:
       - DATABASE_URL=postgresql://user:password@db:5432/hast_db
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - DEBUG_BYPASS_LLM=False
+      # Resilience mode for verifying the full tcpdump-4.9.1 flow end-to-end: every real
+      # stage still runs; mocks fire only on failure so the job always reaches SUCCESS.
+      # Independent of DEBUG_BYPASS_LLM. Set to True to enable.
+      - DEBUG_TEST_TCPDUMP=${DEBUG_TEST_TCPDUMP:-False}
 
   redis:
     image: redis:alpine

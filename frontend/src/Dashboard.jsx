@@ -7,18 +7,20 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 import Editor from '@monaco-editor/react';
 
 const initialNodes = [
-  { id: '1', position: { x: 50, y: 100 }, data: { label: 'Job Submission' }, type: 'input' },
-  { id: '2', position: { x: 250, y: 100 }, data: { label: 'SAST (CodeQL)' } },
-  { id: '3', position: { x: 450, y: 100 }, data: { label: 'AI Harness Gen' } },
-  { id: '4', position: { x: 650, y: 100 }, data: { label: 'DAST (AFL++)' } },
-  { id: '5', position: { x: 850, y: 100 }, data: { label: 'AI Patch Gen' } },
-  { id: '6', position: { x: 1050, y: 100 }, data: { label: 'DB Storage' }, type: 'output' },
+  { id: '1', position: { x: 50,   y: 100 }, data: { label: 'Job Submission' }, type: 'input' },
+  { id: '2', position: { x: 250,  y: 100 }, data: { label: 'SAST (CodeQL)' } },
+  { id: '3', position: { x: 450,  y: 100 }, data: { label: 'AI Harness Gen' } },
+  { id: '7', position: { x: 650,  y: 100 }, data: { label: 'Env Gen (Docker)' } },
+  { id: '4', position: { x: 850,  y: 100 }, data: { label: 'DAST (AFL++)' } },
+  { id: '5', position: { x: 1050, y: 100 }, data: { label: 'AI Patch Gen' } },
+  { id: '6', position: { x: 1250, y: 100 }, data: { label: 'DB Storage' }, type: 'output' },
 ];
 
 const initialEdges = [
   { id: 'e1-2', source: '1', target: '2' },
   { id: 'e2-3', source: '2', target: '3' },
-  { id: 'e3-4', source: '3', target: '4' },
+  { id: 'e3-7', source: '3', target: '7' },
+  { id: 'e7-4', source: '7', target: '4' },
   { id: 'e4-5', source: '4', target: '5' },
   { id: 'e5-6', source: '5', target: '6' },
 ];
@@ -34,13 +36,14 @@ const Dashboard = () => {
   const [taskId, setTaskId] = useState(null);
 
   const nodeMap = {
-    "INIT": "1",
-    "SAST": "2",
+    "INIT":       "1",
+    "SAST":       "2",
     "AI_HARNESS": "3",
-    "DAST": "4",
-    "AI_PATCH": "5",
+    "ENV_GEN":    "7",
+    "DAST":       "4",
+    "AI_PATCH":   "5",
     "DB_STORAGE": "6",
-    "PIPELINE": "6"
+    "PIPELINE":   "6"
   };
 
   const logsEndRef = React.useRef(null);
@@ -277,8 +280,10 @@ const Dashboard = () => {
             {logs.map((log, idx) => {
               const isError = log.includes('Failed') || log.includes('ERROR');
               const isSuccess = log.includes('Success');
+              const isWarning = log.includes('Warning');
+              const colorClass = isError ? "text-red-400" : isSuccess ? "text-green-400" : isWarning ? "text-yellow-400" : "text-gray-300";
               return (
-                <div key={idx} className={isError ? "text-red-400" : isSuccess ? "text-green-400" : "text-gray-300"}>
+                <div key={idx} className={colorClass}>
                   {`> ${log}`}
                 </div>
               );

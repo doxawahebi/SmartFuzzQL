@@ -274,9 +274,13 @@ def activate() -> None:
             )
             shutil.copyfile(BOOTP_SARIF, sarif_path)
 
-    def run_dast_fuzzing(task_id, repo_url, repo_path, harness_code, harness_path):
+    def run_dast_fuzzing(
+        task_id, repo_url, repo_path, harness_code, harness_path, vuln_code=""
+    ):
         try:
-            return _orig_dast(task_id, repo_url, repo_path, harness_code, harness_path)
+            return _orig_dast(
+                task_id, repo_url, repo_path, harness_code, harness_path, vuln_code
+            )
         except Exception as e:
             # LLM harness failed to build/fuzz -> fall back to the known-good harness.c and
             # fuzz for real (no canned crash).

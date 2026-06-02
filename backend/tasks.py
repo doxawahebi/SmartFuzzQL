@@ -17,6 +17,7 @@ import requests
 import io
 import sys
 import tarfile
+from dataclasses import dataclass
 from datetime import datetime
 
 # Ensure this backend directory is importable by absolute path. The Celery worker's
@@ -57,6 +58,7 @@ ALLOWED_GEMINI_MODELS = [
     "gemini-3.5-flash",
 ]
 DEV_LLM_CONFIG_KEY = "dev:llm_config"
+CODE_NOT_FOUND = "Code not found 243234234234234234"
 SAMPLE_REPOS = {
     "sample://buffer-overflow": {
         "name": "Buffer Overflow Sample",
@@ -70,6 +72,40 @@ class PipelineUserError(RuntimeError):
     def __init__(self, message: str, hint: str | None = None):
         super().__init__(message)
         self.hint = hint
+
+
+@dataclass
+class PipelineContext:
+    task_id: str
+    repo_url: str
+    temp_dir: str
+    repo_path: str
+
+
+@dataclass
+class SastStageResult:
+    vuln_msg: str
+    vuln_file: str
+    vuln_line: int | None
+    vuln_code: str
+    results: list
+    call_edge_results: list
+
+
+@dataclass
+class HarnessStageResult:
+    harness_code: str
+    harness_path: str
+
+
+@dataclass
+class DastStageResult:
+    crash_data: bytes | None
+
+
+@dataclass
+class PatchStageResult:
+    patch_code: str
 
 
 def is_sample_repo_url(repo_url: str) -> bool:
@@ -117,6 +153,10 @@ def copy_text_to_container(container, target_dir: str, filename: str, content: s
 
     tar_buffer.seek(0)
     container.put_archive(target_dir, tar_buffer.getvalue())
+
+
+def _code_snippet_or_none(source_code: str) -> str | None:
+    return source_code[:500] if source_code != CODE_NOT_FOUND else None
 
 
 def _extract_taint_path(sarif_result: dict) -> dict:
@@ -446,16 +486,36 @@ def run_dast_fuzzing(
     """Build a per-job fuzzing image, compile the harness (LLM feedback loop), fuzz with
     AFL++, and return the crash input bytes. Raises on build/compile failure or timeout.
     """
-    docker_client = docker.from_env()
     container = None
     try:
-        # Call the existing dynamic builder (we invoke it inline because we need the image)
-        build_res = build_dynamic_fuzzing_env(repo_url, task_id)
-        if build_res["status"] == "Failed":
-            raise Exception(f"Failed to build fuzzer env: {build_res.get('error')}")
-        image_name = build_res["image"]
+        container = _start_fuzzing_container(task_id, repo_url)
+        _compile_harness_with_feedback(
+            task_id, container, harness_code, harness_path, vuln_code
+        )
+        return _run_afl_and_wait_for_crash(task_id, container)
+    finally:
+        _cleanup_container(container)
 
-        # Run container
+
+def _cleanup_container(container):
+    if not container:
+        return
+    try:
+        container.stop(timeout=1)
+        container.remove(force=True)
+    except Exception as e:
+        console.print(f"[red]Failed to cleanup container: {e}[/red]")
+
+
+def _start_fuzzing_container(task_id, repo_url):
+    docker_client = docker.from_env()
+    build_res = build_dynamic_fuzzing_env(repo_url, task_id)
+    if build_res["status"] == "Failed":
+        raise Exception(f"Failed to build fuzzer env: {build_res.get('error')}")
+    image_name = build_res["image"]
+
+    container = None
+    try:
         container = docker_client.containers.run(
             image_name,
             command="tail -f /dev/null",
@@ -464,7 +524,6 @@ def run_dast_fuzzing(
             privileged=True,
         )
 
-        # 409 error : Check if container is running
         container.reload()
         console.print(f"Container status: {container.status}")
         if container.status != "running":
@@ -472,188 +531,497 @@ def run_dast_fuzzing(
             raise Exception(
                 "\ucee8\ud14c\uc774\ub108\uac00 \uc815\uc0c1\uc801\uc73c\ub85c \uc2e4\ud589\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4."
             )
+        return container
+    except Exception:
+        _cleanup_container(container)
+        raise
 
+
+def _compile_harness_with_feedback(
+    task_id, container, harness_code, harness_path, vuln_code
+):
+    copy_text_to_container(container, "/target", "harness.c", harness_code)
+
+    compile_cmd = (
+        "afl-clang-fast -fsanitize=address -I/usr/local/include/afl++ "
+        "-o fuzz_target harness.c"
+    )
+    max_compile_retries = 3
+    compile_success = False
+
+    for attempt in range(1, max_compile_retries + 1):
+        notify_status(
+            task_id,
+            "DAST",
+            "Running",
+            f"Compiling harness (Attempt {attempt}/{max_compile_retries})...",
+        )
+        compile_res = container.exec_run(compile_cmd, user="root", demux=True)
+
+        if compile_res.exit_code == 0:
+            compile_success = True
+            notify_status(task_id, "DAST", "Success", "Harness compiled successfully.")
+            break
+
+        # When demux=True is set, compile_res.output returns a
+        # (stdout_bytes, stderr_bytes) tuple.
+        stdout_bytes, stderr_bytes = compile_res.output
+        stdout_str = (
+            stdout_bytes.decode("utf-8", errors="replace").strip()
+            if stdout_bytes
+            else "No STDOUT"
+        )
+        stderr_str = (
+            stderr_bytes.decode("utf-8", errors="replace").strip()
+            if stderr_bytes
+            else "No STDERR"
+        )
+
+        error_msg = (
+            f"Failed to compile harness!\n"
+            f"[Command]  {compile_cmd}\n"
+            f"[Exit Code] {compile_res.exit_code}\n"
+            f"{'-'*20} STDOUT {'-'*20}\n"
+            f"{stdout_str}\n"
+            f"{'-'*20} STDERR {'-'*20}\n"
+            f"{stderr_str}\n"
+            f"{'-'*48}"
+        )
+
+        if attempt == max_compile_retries:
+            raise Exception(error_msg)
+        notify_status(
+            task_id,
+            "DAST",
+            "Warning",
+            "Compilation failed. Requesting quick fix from LLM...",
+        )
+        fix_prompt = (
+            "The following C harness failed to compile. Fix the errors based on the "
+            "compiler output and return only the corrected complete C code. Do not "
+            "explain.\n\n"
+            f"Compiler Output:\n{stderr_str}\n\n"
+            "Original Target Source (for correct function signatures):\n"
+            f"```c\n{truncate_for_prompt(vuln_code)}\n```\n\n"
+            f"Broken Harness:\n```c\n{harness_code}\n```"
+        )
+        fix_resp = call_llm_api(
+            fix_prompt, model="gemini-2.5-flash", task_type="harness"
+        )
+        harness_code = extract_c_code(fix_resp)
+
+        with open(harness_path, "w") as f:
+            f.write(harness_code)
         copy_text_to_container(container, "/target", "harness.c", harness_code)
 
-        # Compile harness with feedback loop
-        compile_cmd = "afl-clang-fast -fsanitize=address -I/usr/local/include/afl++ -o fuzz_target harness.c"
-        max_compile_retries = 3
-        compile_success = False
+    if not compile_success:
+        raise Exception("Failed to compile harness after maximum retries.")
 
-        for attempt in range(1, max_compile_retries + 1):
+
+def _parse_afl_stats(stats_str: str) -> dict:
+    afl_stats = {}
+    for line in stats_str.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            afl_stats[k.strip()] = v.strip()
+    elapsed_sec = 0
+    raw_time = afl_stats.get("run_time", "0")
+    try:
+        elapsed_sec = int(raw_time.split()[0])
+    except (ValueError, IndexError):
+        pass
+    try:
+        execs = int(afl_stats.get("execs_done", "0") or "0")
+        crashes = int(afl_stats.get("unique_crashes", "0") or "0")
+    except ValueError:
+        execs = 0
+        crashes = 0
+    return {"time_sec": elapsed_sec, "execs": execs, "crashes": crashes}
+
+
+def _run_afl_and_wait_for_crash(task_id, container):
+    TIME_MINITUTE = 1
+    POLL_INTERVAL = 10
+
+    container.exec_run("mkdir -p inputs outputs", user="root")
+    container.exec_run("sh -c 'echo A > inputs/seed'", user="root")
+    container.exec_run("sh -c 'echo core > /proc/sys/kernel/core_pattern'", user="root")
+
+    notify_status(
+        task_id,
+        "DAST",
+        "Running",
+        f"Starting AFL++ fuzzing... This may take up to {TIME_MINITUTE} minutes. "
+        "Monitoring for crashes.",
+    )
+    fuzz_cmd = (
+        "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_SKIP_CPUFREQ=1 "
+        "afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target "
+        "> fuzzer_stdout.log 2> fuzzer_stderr.log"
+    )
+    container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
+
+    time.sleep(2)
+    fuzzer_stdout = container.exec_run("cat fuzzer_stdout.log", user="root")
+    fuzzer_stderr = container.exec_run("cat fuzzer_stderr.log", user="root")
+    console.print(
+        f"[DEBUG] AFL++ STDOUT:\n{fuzzer_stdout.output.decode('utf-8', errors='replace')}"
+    )
+    console.print(
+        f"[DEBUG] AFL++ STDERR:\n{fuzzer_stderr.output.decode('utf-8', errors='replace')}"
+    )
+
+    notify_status(
+        task_id,
+        "DAST",
+        "Running",
+        f"Fuzzer started. Polling for crashes every {POLL_INTERVAL} seconds...",
+    )
+
+    timeout = TIME_MINITUTE * 60
+    start = time.time()
+    crash_found = False
+    crash_data = None
+
+    while time.time() - start < timeout:
+        console.print(
+            f"[DEBUG] Polling loop running... Elapsed: {time.time() - start:.1f}s"
+        )
+        stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
+        if stats.exit_code == 0:
+            stats_str = stats.output.decode("utf-8")
             notify_status(
                 task_id,
                 "DAST",
                 "Running",
-                f"Compiling harness (Attempt {attempt}/{max_compile_retries})...",
+                f"Fuzzer running... Stats:\n{stats_str[:200]}...",
+                extra={"fuzz_stats": _parse_afl_stats(stats_str)},
             )
-            compile_res = container.exec_run(compile_cmd, user="root", demux=True)
-
-            if compile_res.exit_code == 0:
-                compile_success = True
-                notify_status(
-                    task_id, "DAST", "Success", "Harness compiled successfully."
-                )
-                break
-
-            # When demux=True is set, compile_res.output returns a (stdout_bytes, stderr_bytes) tuple.
-            stdout_bytes, stderr_bytes = compile_res.output
-            stdout_str = (
-                stdout_bytes.decode("utf-8", errors="replace").strip()
-                if stdout_bytes
-                else "No STDOUT"
-            )
-            stderr_str = (
-                stderr_bytes.decode("utf-8", errors="replace").strip()
-                if stderr_bytes
-                else "No STDERR"
-            )
-
-            error_msg = (
-                f"Failed to compile harness!\n"
-                f"[Command]  {compile_cmd}\n"
-                f"[Exit Code] {compile_res.exit_code}\n"
-                f"{'-'*20} STDOUT {'-'*20}\n"
-                f"{stdout_str}\n"
-                f"{'-'*20} STDERR {'-'*20}\n"
-                f"{stderr_str}\n"
-                f"{'-'*48}"
-            )
-
-            if attempt == max_compile_retries:
-                raise Exception(error_msg)
-            notify_status(
-                task_id,
-                "DAST",
-                "Warning",
-                "Compilation failed. Requesting quick fix from LLM...",
-            )
-            fix_prompt = f"The following C harness failed to compile. Fix the errors based on the compiler output and return only the corrected complete C code. Do not explain.\n\nCompiler Output:\n{stderr_str}\n\nOriginal Target Source (for correct function signatures):\n```c\n{truncate_for_prompt(vuln_code)}\n```\n\nBroken Harness:\n```c\n{harness_code}\n```"
-            fix_resp = call_llm_api(
-                fix_prompt, model="gemini-2.5-flash", task_type="harness"
-            )
-            harness_code = extract_c_code(fix_resp)
-
-            # Update the local file and container
-            with open(harness_path, "w") as f:
-                f.write(harness_code)
-            copy_text_to_container(container, "/target", "harness.c", harness_code)
-
-        if not compile_success:
-            raise Exception("Failed to compile harness after maximum retries.")
-
-        TIME_MINITUTE = 1
-        POLL_INTERVAL = 10
-
-        # Setup basic inputs and run afl-fuzz
-        container.exec_run("mkdir -p inputs outputs", user="root")
-        container.exec_run("sh -c 'echo A > inputs/seed'", user="root")
-        container.exec_run(
-            "sh -c 'echo core > /proc/sys/kernel/core_pattern'", user="root"
-        )
-
-        notify_status(
-            task_id,
-            "DAST",
-            "Running",
-            f"Starting AFL++ fuzzing... This may take up to {TIME_MINITUTE} minutes. Monitoring for crashes.",
-        )
-        fuzz_cmd = "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -i ./inputs -o ./outputs -m none -- ./fuzz_target > fuzzer_stdout.log 2> fuzzer_stderr.log"
-        container.exec_run(f"sh -c '{fuzz_cmd} &'", user="root", detach=True)
-
-        # Read the background process logs to verify it started correctly
-        time.sleep(2)
-        fuzzer_stdout = container.exec_run("cat fuzzer_stdout.log", user="root")
-        fuzzer_stderr = container.exec_run("cat fuzzer_stderr.log", user="root")
-        console.print(
-            f"[DEBUG] AFL++ STDOUT:\n{fuzzer_stdout.output.decode('utf-8', errors='replace')}"
-        )
-        console.print(
-            f"[DEBUG] AFL++ STDERR:\n{fuzzer_stderr.output.decode('utf-8', errors='replace')}"
-        )
-
-        notify_status(
-            task_id,
-            "DAST",
-            "Running",
-            f"Fuzzer started. Polling for crashes every {POLL_INTERVAL} seconds...",
-        )
-
-        # Poll for the configured timeout
-        timeout = TIME_MINITUTE * 60
-        start = time.time()
-        crash_found = False
-        crash_data = None
-
-        while time.time() - start < timeout:
+        else:
             console.print(
-                f"[DEBUG] Polling loop running... Elapsed: {time.time() - start:.1f}s"
+                f"[DEBUG] fuzzer_stats not found yet. Exit code: {stats.exit_code}"
             )
-            stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
-            if stats.exit_code == 0:
-                stats_str = stats.output.decode("utf-8")
-                afl_stats = {}
-                for line in stats_str.splitlines():
-                    if ":" in line:
-                        k, _, v = line.partition(":")
-                        afl_stats[k.strip()] = v.strip()
-                elapsed_sec = 0
-                raw_time = afl_stats.get("run_time", "0")
-                try:
-                    elapsed_sec = int(raw_time.split()[0])
-                except (ValueError, IndexError):
-                    pass
-                try:
-                    execs = int(afl_stats.get("execs_done", "0") or "0")
-                    crashes = int(afl_stats.get("unique_crashes", "0") or "0")
-                except ValueError:
-                    execs = 0
-                    crashes = 0
-                notify_status(
-                    task_id,
-                    "DAST",
-                    "Running",
-                    f"Fuzzer running... Stats:\n{stats_str[:200]}...",
-                    extra={
-                        "fuzz_stats": {
-                            "time_sec": elapsed_sec,
-                            "execs": execs,
-                            "crashes": crashes,
-                        }
-                    },
-                )
-            else:
-                # No stats file yet
-                console.print(
-                    f"[DEBUG] fuzzer_stats not found yet. Exit code: {stats.exit_code}"
-                )
 
-            crashes = container.exec_run(
-                "sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root"
+        crashes = container.exec_run(
+            "sh -c 'ls outputs/default/crashes/id:* 2>/dev/null'", user="root"
+        )
+        if crashes.exit_code == 0 and crashes.output.decode("utf-8").strip():
+            crash_found = True
+            crash_files = crashes.output.decode("utf-8").strip().split()
+            if crash_files:
+                crash_content = container.exec_run(f"cat {crash_files[0]}", user="root")
+                crash_data = crash_content.output
+            notify_status(task_id, "DAST", "Success", "Crash found!")
+            break
+        time.sleep(POLL_INTERVAL)
+
+    if not crash_found:
+        notify_status(task_id, "DAST", "Failed", "No crash found within timeout")
+        raise Exception("Timeout reached without finding crash")
+    return crash_data
+
+
+def _run_initialization_stage(context: PipelineContext):
+    notify_status(
+        context.task_id,
+        "INIT",
+        "Running",
+        f"Starting pipeline for {context.repo_url} in {context.temp_dir}",
+    )
+    clone_repo(context.task_id, context.repo_url, context.temp_dir)
+
+
+def _load_call_edge_results(task_id: str, callgraph_sarif_path: str) -> list:
+    if not os.path.exists(callgraph_sarif_path):
+        return []
+    try:
+        with open(callgraph_sarif_path, "r") as f:
+            return json.load(f).get("runs", [{}])[0].get("results", [])
+    except (json.JSONDecodeError, OSError) as e:
+        notify_status(task_id, "SAST", "Warning", f"Could not read call-graph SARIF: {e}")
+        return []
+
+
+def _select_vulnerability(results: list) -> tuple[str, str, int | None]:
+    vuln_msg = "Unknown vulnerability"
+    vuln_file = "unknown"
+    vuln_line = None
+    if results:
+        vuln_msg = results[0].get("message", {}).get("text", "")
+        console.print(f"vuln_msg : {vuln_msg}")
+        locations = results[0].get("locations", [])
+        console.print(f"locations : {locations}")
+        if locations:
+            physical = locations[0].get("physicalLocation", {})
+            vuln_file = physical.get("artifactLocation", {}).get("uri", "")
+            # Sink line drives the function-scoped patch (see backend/patching.py).
+            vuln_line = physical.get("region", {}).get("startLine")
+    return vuln_msg, vuln_file, vuln_line
+
+
+def _read_vulnerable_code(repo_path: str, vuln_file: str) -> str:
+    vuln_file_full = os.path.join(repo_path, vuln_file)
+    console.print(f"vuln_file_full: {vuln_file_full}")
+    if os.path.exists(vuln_file_full):
+        with open(vuln_file_full, "r") as f:
+            return f.read()
+    return CODE_NOT_FOUND
+
+
+def _run_sast_stage(context: PipelineContext) -> SastStageResult:
+    notify_status(
+        context.task_id,
+        "SAST",
+        "Running",
+        "Cloning and extracting source-level logical vulnerabilities via CodeQL",
+    )
+    db_path = os.path.join(context.temp_dir, "my-db")
+    sarif_path = os.path.join(context.temp_dir, "results.sarif")
+    callgraph_sarif_path = os.path.join(context.temp_dir, "callgraph.sarif")
+    run_codeql_analysis(
+        context.task_id, context.temp_dir, db_path, sarif_path, callgraph_sarif_path
+    )
+
+    with open(sarif_path, "r") as f:
+        sarif_data = json.load(f)
+
+    call_edge_results = _load_call_edge_results(
+        context.task_id, callgraph_sarif_path
+    )
+    all_results = sarif_data.get("runs", [{}])[0].get("results", [])
+    # The vuln pass no longer emits call edges, but filter defensively in case the
+    # pack layout changes and both query sets land in one SARIF.
+    results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
+    console.print(f"results : {results}")
+    vuln_msg, vuln_file, vuln_line = _select_vulnerability(results)
+    vuln_code = _read_vulnerable_code(context.repo_path, vuln_file)
+    console.print(f"vuln_code : {vuln_code}")
+
+    notify_status(
+        context.task_id,
+        "SAST",
+        "Success",
+        f"Found vulnerability: {vuln_msg} in {vuln_file}",
+        extra={
+            "vuln": {
+                "message": vuln_msg,
+                "file": vuln_file,
+                "code_snippet": _code_snippet_or_none(vuln_code),
+            }
+        },
+    )
+    return SastStageResult(
+        vuln_msg=vuln_msg,
+        vuln_file=vuln_file,
+        vuln_line=vuln_line,
+        vuln_code=vuln_code,
+        results=results,
+        call_edge_results=call_edge_results,
+    )
+
+
+def _run_ai_harness_stage(
+    context: PipelineContext, sast: SastStageResult
+) -> HarnessStageResult:
+    notify_status(
+        context.task_id,
+        "AI_HARNESS",
+        "Running",
+        "Requesting source-code level C harness from LLM",
+    )
+    vuln_code_ctx = truncate_for_prompt(sast.vuln_code)
+    prompt = (
+        "Write a complete C harness for AFL++ persistent mode targeting the "
+        f"function(s) in this file: {sast.vuln_file}.\n"
+        f"Use __AFL_FUZZ_INIT(), a `while (__AFL_LOOP(1000))` loop, and read the test case from "
+        f"__AFL_FUZZ_TESTCASE_BUF / __AFL_FUZZ_TESTCASE_LEN. Define your own `int main()` "
+        f"(do NOT define LLVMFuzzerTestOneInput). Call the vulnerable function so "
+        "the crash is reachable.\n"
+        f"Vulnerability: {sast.vuln_msg}\n"
+        f"Source Code:\n```c\n{vuln_code_ctx}\n```\n"
+        f"Return ONLY the complete C harness inside a single ```c code block. Do not explain."
+    )
+    llm_resp = call_llm_api(prompt, model="gemini-2.5-flash", task_type="harness")
+    harness_code = extract_c_code(llm_resp)
+    harness_path = os.path.join(context.repo_path, "harness.c")
+    console.print(f"harness_path : {harness_path}")
+    console.print(f"harness_code : {harness_code}")
+    with open(harness_path, "w") as f:
+        f.write(harness_code)
+    return HarnessStageResult(harness_code=harness_code, harness_path=harness_path)
+
+
+def _run_dast_stage(
+    context: PipelineContext, sast: SastStageResult, harness: HarnessStageResult
+) -> DastStageResult:
+    notify_status(
+        context.task_id,
+        "DAST",
+        "Running",
+        "Fuzzing via isolated container against generated harness (max 20 mins)",
+    )
+    crash_data = run_dast_fuzzing(
+        context.task_id,
+        context.repo_url,
+        context.repo_path,
+        harness.harness_code,
+        harness.harness_path,
+        sast.vuln_code,
+    )
+    return DastStageResult(crash_data=crash_data)
+
+
+def _run_ai_patch_stage(
+    context: PipelineContext, sast: SastStageResult, dast: DastStageResult
+) -> PatchStageResult:
+    notify_status(
+        context.task_id,
+        "AI_PATCH",
+        "Running",
+        "Crash verified. Querying LLM for source-code secure patch",
+    )
+    crash_hex = dast.crash_data.hex() if dast.crash_data else None
+    vuln_function = patching.extract_vulnerable_function(
+        sast.vuln_code, sast.vuln_line
+    )
+    patch_snippet = vuln_function or patching.truncate_for_prompt(sast.vuln_code)
+    patch_prompt = patching.build_patch_prompt(
+        patch_snippet, sast.vuln_msg, crash_hex
+    )
+    patch_resp = call_llm_api(
+        patch_prompt, model="gemini-2.5-flash", task_type="patch"
+    )
+    patched_function = extract_c_code(patch_resp)
+    if vuln_function:
+        patch_code = patching.splice_patch(
+            sast.vuln_code, sast.vuln_line, patched_function
+        )
+    else:
+        patch_code = patched_function
+    patch_path = os.path.join(
+        context.repo_path, "patched_" + os.path.basename(sast.vuln_file)
+    )
+    with open(patch_path, "w") as f:
+        f.write(patch_code)
+    return PatchStageResult(patch_code=patch_code)
+
+
+def _select_taint_result(sast: SastStageResult) -> dict | None:
+    return next(
+        (r for r in sast.results if r.get("codeFlows")),
+        sast.results[0] if sast.results else None,
+    )
+
+
+def _run_db_storage_stage(
+    context: PipelineContext,
+    sast: SastStageResult,
+    dast: DastStageResult,
+    patch_result: PatchStageResult,
+):
+    notify_status(
+        context.task_id,
+        "DB_STORAGE",
+        "Running",
+        "Storing vulnerability, harness, fuzzer trace, and patches in PostgreSQL",
+    )
+    try:
+        from database import SessionLocal
+        from models import Job as JobModel
+
+        db = SessionLocal()
+        try:
+            job_row = db.query(JobModel).filter(JobModel.task_id == context.task_id).first()
+            if job_row:
+                job_row.state = "SUCCESS"
+                job_row.completed_at = datetime.utcnow()
+                job_row.vuln_message = sast.vuln_msg
+                job_row.vuln_file = sast.vuln_file
+                job_row.code_snippet = _code_snippet_or_none(sast.vuln_code)
+                job_row.original_code = (
+                    sast.vuln_code if sast.vuln_code != CODE_NOT_FOUND else None
+                )
+                taint_result = _select_taint_result(sast)
+                taint_path = (
+                    _extract_taint_path(taint_result)
+                    if taint_result
+                    else {"nodes": [], "edges": []}
+                )
+                sink_line = (
+                    taint_path["nodes"][-1]["start_line"] if taint_path["nodes"] else 0
+                )
+                job_row.taint_path = taint_path
+                job_row.call_path = _extract_call_path(
+                    sast.call_edge_results,
+                    vuln_result=taint_result,
+                    sink_line=sink_line,
+                )
+                job_row.patch_generated = True
+                job_row.crash_hex = dast.crash_data.hex() if dast.crash_data else None
+                job_row.patch_code = patch_result.patch_code
+                db.commit()
+            notify_status(
+                context.task_id, "DB_STORAGE", "Success", "Results stored in PostgreSQL"
             )
-            if crashes.exit_code == 0 and crashes.output.decode("utf-8").strip():
-                crash_found = True
-                crash_files = crashes.output.decode("utf-8").strip().split()
-                if crash_files:
-                    crash_content = container.exec_run(
-                        f"cat {crash_files[0]}", user="root"
-                    )
-                    crash_data = crash_content.output
-                notify_status(task_id, "DAST", "Success", "Crash found!")
-                break
-            time.sleep(POLL_INTERVAL)
+        except Exception as db_err:
+            db.rollback()
+            notify_status(
+                context.task_id, "DB_STORAGE", "Warning", f"DB write failed: {db_err}"
+            )
+        finally:
+            db.close()
+    except ImportError as imp_err:
+        notify_status(
+            context.task_id,
+            "DB_STORAGE",
+            "Warning",
+            f"Database module unavailable, skipping storage: {imp_err!r}",
+        )
 
-        if not crash_found:
-            notify_status(task_id, "DAST", "Failed", "No crash found within timeout")
-            raise Exception("Timeout reached without finding crash")
-        return crash_data
-    finally:
-        if container:
-            try:
-                container.stop(timeout=1)
-                container.remove(force=True)
-            except Exception as e:
-                console.print(f"[red]Failed to cleanup container: {e}[/red]")
+
+def _emit_pipeline_success(
+    context: PipelineContext,
+    sast: SastStageResult,
+    dast: DastStageResult,
+    patch_result: PatchStageResult,
+) -> dict:
+    notify_status(
+        context.task_id,
+        "PIPELINE",
+        "Success",
+        "Pipeline completely executed.",
+        extra={
+            "result": {
+                "repo": context.repo_url,
+                "vuln_msg": sast.vuln_msg,
+                "vuln_file": sast.vuln_file,
+                "patch_generated": True,
+                "crash_hex": dast.crash_data.hex() if dast.crash_data else None,
+                "patch_code": patch_result.patch_code,
+            }
+        },
+    )
+    return {"status": "Complete", "repo": context.repo_url, "patch_generated": True}
+
+
+def _mark_pipeline_failed(task_id: str):
+    try:
+        from database import SessionLocal
+        from models import Job as JobModel
+
+        db = SessionLocal()
+        try:
+            job_row = db.query(JobModel).filter(JobModel.task_id == task_id).first()
+            if job_row:
+                job_row.state = "FAILURE"
+                job_row.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+    except ImportError:
+        pass
 
 
 @celery_app.task(bind=True)
@@ -663,265 +1031,28 @@ def run_pipeline(self, repo_url: str):
 
 def _run_pipeline_impl(task_id: str, repo_url: str):
     temp_dir = tempfile.mkdtemp(prefix=f"pipeline_run_{task_id}_")
+    context = PipelineContext(
+        task_id=task_id,
+        repo_url=repo_url,
+        temp_dir=temp_dir,
+        repo_path=temp_dir,
+    )
     console.print(f"temp_dir : {temp_dir}")
     try:
-        notify_status(
-            task_id,
-            "INIT",
-            "Running",
-            f"Starting pipeline for {repo_url} in {temp_dir}",
-        )
-        clone_repo(task_id, repo_url, temp_dir)
-        repo_path = temp_dir
-
-        # Step 1: SAST (CodeQL)
-        notify_status(
-            task_id,
-            "SAST",
-            "Running",
-            "Cloning and extracting source-level logical vulnerabilities via CodeQL",
-        )
-        db_path = os.path.join(temp_dir, "my-db")
-        sarif_path = os.path.join(temp_dir, "results.sarif")
-        callgraph_sarif_path = os.path.join(temp_dir, "callgraph.sarif")
-        run_codeql_analysis(
-            task_id, temp_dir, db_path, sarif_path, callgraph_sarif_path
-        )
-
-        with open(sarif_path, "r") as f:
-            sarif_data = json.load(f)
-
-        # Load call-graph edges from the separate pass (best-effort; may be absent).
-        call_edge_results = []
-        if os.path.exists(callgraph_sarif_path):
-            try:
-                with open(callgraph_sarif_path, "r") as f:
-                    call_edge_results = (
-                        json.load(f).get("runs", [{}])[0].get("results", [])
-                    )
-            except (json.JSONDecodeError, OSError) as e:
-                notify_status(
-                    task_id, "SAST", "Warning", f"Could not read call-graph SARIF: {e}"
-                )
-
-        vuln_msg = "Unknown vulnerability"
-        vuln_file = "unknown"
-        vuln_line = None
-        all_results = sarif_data.get("runs", [{}])[0].get("results", [])
-        # The vuln pass no longer emits call edges, but filter defensively in case the
-        # pack layout changes and both query sets land in one SARIF.
-        results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
-        console.print(f"results : {results}")
-        if results:
-            vuln_msg = results[0].get("message", {}).get("text", "")
-            console.print(f"vuln_msg : {vuln_msg}")
-            locations = results[0].get("locations", [])
-            console.print(f"locations : {locations}")
-            if locations:
-                physical = locations[0].get("physicalLocation", {})
-                vuln_file = physical.get("artifactLocation", {}).get("uri", "")
-                # Sink line drives the function-scoped patch (see backend/patching.py).
-                vuln_line = physical.get("region", {}).get("startLine")
-
-        vuln_file_full = os.path.join(repo_path, vuln_file)
-        console.print(f"vuln_file_full: {vuln_file_full}")
-        vuln_code = "Code not found 243234234234234234"
-        if os.path.exists(vuln_file_full):
-            with open(vuln_file_full, "r") as f:
-                vuln_code = f.read()
-        console.print(f"vuln_code : {vuln_code}")
-
-        notify_status(
-            task_id,
-            "SAST",
-            "Success",
-            f"Found vulnerability: {vuln_msg} in {vuln_file}",
-            extra={
-                "vuln": {
-                    "message": vuln_msg,
-                    "file": vuln_file,
-                    "code_snippet": (
-                        vuln_code[:500]
-                        if vuln_code != "Code not found 243234234234234234"
-                        else None
-                    ),
-                }
-            },
-        )
-
-        # Step 2: AI Harness Generation
-        notify_status(
-            task_id,
-            "AI_HARNESS",
-            "Running",
-            "Requesting source-code level C harness from LLM",
-        )
-        vuln_code_ctx = truncate_for_prompt(vuln_code)
-        prompt = (
-            f"Write a complete C harness for AFL++ persistent mode targeting the function(s) in this file: {vuln_file}.\n"
-            f"Use __AFL_FUZZ_INIT(), a `while (__AFL_LOOP(1000))` loop, and read the test case from "
-            f"__AFL_FUZZ_TESTCASE_BUF / __AFL_FUZZ_TESTCASE_LEN. Define your own `int main()` "
-            f"(do NOT define LLVMFuzzerTestOneInput). Call the vulnerable function so the crash is reachable.\n"
-            f"Vulnerability: {vuln_msg}\n"
-            f"Source Code:\n```c\n{vuln_code_ctx}\n```\n"
-            f"Return ONLY the complete C harness inside a single ```c code block. Do not explain."
-        )
-        llm_resp = call_llm_api(prompt, model="gemini-2.5-flash", task_type="harness")
-        harness_code = extract_c_code(llm_resp)
-        harness_path = os.path.join(repo_path, "harness.c")
-        console.print(f"harness_path : {harness_path}")
-        console.print(f"harness_code : {harness_code}")
-        with open(harness_path, "w") as f:
-            f.write(harness_code)
-
-        # Step 3: DAST (AFL++)
-        notify_status(
-            task_id,
-            "DAST",
-            "Running",
-            "Fuzzing via isolated container against generated harness (max 20 mins)",
-        )
-        crash_data = run_dast_fuzzing(
-            task_id, repo_url, repo_path, harness_code, harness_path, vuln_code
-        )
-
-        # Step 4: AI Patch Generation
-        notify_status(
-            task_id,
-            "AI_PATCH",
-            "Running",
-            "Crash verified. Querying LLM for source-code secure patch",
-        )
-        # Feed the LLM the enclosing vulnerable function (not a blind file-head truncation,
-        # which for large targets never contains the sink) so the patch is grounded in the
-        # real vulnerable code. Splice the patched function back into the full file so the
-        # stored diff is minimal and aligned, and the SARIF line numbers still match.
-        crash_hex = crash_data.hex() if crash_data else None
-        vuln_function = patching.extract_vulnerable_function(vuln_code, vuln_line)
-        patch_snippet = vuln_function or patching.truncate_for_prompt(vuln_code)
-        patch_prompt = patching.build_patch_prompt(patch_snippet, vuln_msg, crash_hex)
-        patch_resp = call_llm_api(
-            patch_prompt, model="gemini-2.5-flash", task_type="patch"
-        )
-        patched_function = extract_c_code(patch_resp)
-        if vuln_function:
-            patch_code = patching.splice_patch(vuln_code, vuln_line, patched_function)
-        else:
-            patch_code = patched_function
-        patch_path = os.path.join(repo_path, "patched_" + os.path.basename(vuln_file))
-        with open(patch_path, "w") as f:
-            f.write(patch_code)
-
-        # Step 5: DB Storage
-        notify_status(
-            task_id,
-            "DB_STORAGE",
-            "Running",
-            "Storing vulnerability, harness, fuzzer trace, and patches in PostgreSQL",
-        )
-        try:
-            from database import SessionLocal
-            from models import Job as JobModel
-
-            db = SessionLocal()
-            try:
-                job_row = db.query(JobModel).filter(JobModel.task_id == task_id).first()
-                if job_row:
-                    job_row.state = "SUCCESS"
-                    job_row.completed_at = datetime.utcnow()
-                    job_row.vuln_message = vuln_msg
-                    job_row.vuln_file = vuln_file
-                    job_row.code_snippet = (
-                        vuln_code[:500]
-                        if vuln_code != "Code not found 243234234234234234"
-                        else None
-                    )
-                    job_row.original_code = (
-                        vuln_code
-                        if vuln_code != "Code not found 243234234234234234"
-                        else None
-                    )
-                    # Prefer the finding that carries a data-flow path (codeFlows).
-                    taint_result = next(
-                        (r for r in results if r.get("codeFlows")),
-                        results[0] if results else None,
-                    )
-                    taint_path = (
-                        _extract_taint_path(taint_result)
-                        if taint_result
-                        else {"nodes": [], "edges": []}
-                    )
-                    sink_line = (
-                        taint_path["nodes"][-1]["start_line"]
-                        if taint_path["nodes"]
-                        else 0
-                    )
-                    job_row.taint_path = taint_path
-                    job_row.call_path = _extract_call_path(
-                        call_edge_results, vuln_result=taint_result, sink_line=sink_line
-                    )
-                    job_row.patch_generated = True
-                    job_row.crash_hex = crash_data.hex() if crash_data else None
-                    job_row.patch_code = patch_code
-                    db.commit()
-                notify_status(
-                    task_id, "DB_STORAGE", "Success", "Results stored in PostgreSQL"
-                )
-            except Exception as db_err:
-                db.rollback()
-                notify_status(
-                    task_id, "DB_STORAGE", "Warning", f"DB write failed: {db_err}"
-                )
-            finally:
-                db.close()
-        except ImportError as imp_err:
-            notify_status(
-                task_id,
-                "DB_STORAGE",
-                "Warning",
-                f"Database module unavailable, skipping storage: {imp_err!r}",
-            )
-
-        notify_status(
-            task_id,
-            "PIPELINE",
-            "Success",
-            "Pipeline completely executed.",
-            extra={
-                "result": {
-                    "repo": repo_url,
-                    "vuln_msg": vuln_msg,
-                    "vuln_file": vuln_file,
-                    "patch_generated": True,
-                    "crash_hex": crash_data.hex() if crash_data else None,
-                    "patch_code": patch_code,
-                }
-            },
-        )
-        return {"status": "Complete", "repo": repo_url, "patch_generated": True}
+        _run_initialization_stage(context)
+        sast = _run_sast_stage(context)
+        harness = _run_ai_harness_stage(context, sast)
+        dast = _run_dast_stage(context, sast, harness)
+        patch_result = _run_ai_patch_stage(context, sast, dast)
+        _run_db_storage_stage(context, sast, dast, patch_result)
+        return _emit_pipeline_success(context, sast, dast, patch_result)
 
     except Exception as e:
         extra = None
         if isinstance(e, PipelineUserError):
             extra = {"error_hint": e.hint}
         notify_status(task_id, "PIPELINE", "Failed", str(e), extra=extra)
-        try:
-            from database import SessionLocal
-            from models import Job as JobModel
-
-            db = SessionLocal()
-            try:
-                job_row = db.query(JobModel).filter(JobModel.task_id == task_id).first()
-                if job_row:
-                    job_row.state = "FAILURE"
-                    job_row.completed_at = datetime.utcnow()
-                    db.commit()
-            except Exception:
-                db.rollback()
-            finally:
-                db.close()
-        except ImportError:
-            pass
+        _mark_pipeline_failed(task_id)
         raise e
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

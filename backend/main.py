@@ -271,6 +271,41 @@ def _update_job_store(task_id: str, payload: dict) -> None:
         job_store[task_id]["result"] = payload["result"]
 
 
+def _job_store_entry_from_db(job: Job) -> dict:
+    """Build the same status shape as the live WebSocket store from PostgreSQL."""
+    vuln = None
+    if job.vuln_message or job.vuln_file or job.code_snippet:
+        vuln = {
+            "message": job.vuln_message or "",
+            "file": job.vuln_file or "",
+            "code_snippet": job.code_snippet,
+        }
+
+    result = None
+    if job.patch_generated is not None or job.crash_hex or job.patch_code:
+        result = {
+            "repo": job.repo_url,
+            "vuln_msg": job.vuln_message or "",
+            "vuln_file": job.vuln_file or "",
+            "patch_generated": bool(job.patch_generated),
+            "crash_hex": job.crash_hex,
+            "patch_code": job.patch_code,
+        }
+
+    return {
+        "task_id": job.task_id,
+        "state": job.state,
+        "repo_url": job.repo_url,
+        "submitted_at": (
+            job.submitted_at.replace(tzinfo=timezone.utc).isoformat()
+            if job.submitted_at
+            else None
+        ),
+        "vuln": vuln,
+        "result": result,
+    }
+
+
 def _db_sync_update(task_id: str, payload: dict) -> None:
     """Persist a pipeline status update to PostgreSQL (called in a thread pool)."""
     step = payload.get("step")
@@ -479,10 +514,16 @@ async def list_jobs():
 
 
 @app.get("/api/jobs/{task_id}", response_model=JobStatusResponse)
-async def get_job(task_id: str):
-    if task_id not in job_store:
+def get_job(task_id: str, db: Session = Depends(get_db)):
+    db_job = db.query(Job).filter(Job.task_id == task_id).first()
+    if db_job:
+        entry = _job_store_entry_from_db(db_job)
+        job_store[task_id] = entry
+    elif task_id in job_store:
+        entry = job_store[task_id]
+    else:
         raise HTTPException(status_code=404, detail="Job not found")
-    entry = job_store[task_id]
+
     vuln = VulnFinding(**entry["vuln"]) if entry.get("vuln") else None
     result = PipelineResult(**entry["result"]) if entry.get("result") else None
     return JobStatusResponse(

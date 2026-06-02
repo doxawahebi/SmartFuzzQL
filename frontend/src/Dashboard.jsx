@@ -53,6 +53,50 @@ const Dashboard = () => {
   const wsRef = React.useRef(null);
   const taskIdRef = React.useRef(null);
 
+  const applyNodeStatus = (step, status) => {
+    const nodeId = nodeMap[step];
+    if (!nodeId) return;
+    setNodes((nds) => nds.map((node) => {
+      if (node.id === nodeId) {
+        const ringColor = status === 'Running' ? '#60a5fa' : status === 'Success' ? '#10b981' : status === 'Failed' ? '#ef4444' : '#374151';
+        return {
+          ...node,
+          style: {
+            background: '#1f2937',
+            color: 'white',
+            border: `2px solid ${ringColor}`,
+            boxShadow: status === 'Running' ? `0 0 15px ${ringColor}` : 'none',
+            borderRadius: '5px',
+            padding: '10px'
+          }
+        };
+      }
+      return node;
+    }));
+  };
+
+  const syncJobStatus = async (currentTaskId) => {
+    if (!currentTaskId) return;
+    try {
+      const apiHost = window.location.hostname;
+      const apiUrl = `${window.location.protocol}//${apiHost}:8000/api/jobs/${currentTaskId}`;
+      const res = await fetch(apiUrl);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.vuln) setVulnData(data.vuln);
+      if (data.result) setPipelineResult(data.result);
+      if (data.state === 'SUCCESS') {
+        applyNodeStatus('PIPELINE', 'Success');
+      } else if (data.state === 'FAILURE') {
+        applyNodeStatus('PIPELINE', 'Failed');
+      }
+      const syncLine = `[SYNC] Job state: ${data.state}`;
+      setLogs((prev) => prev.includes(syncLine) ? prev : [...prev, syncLine]);
+    } catch (err) {
+      setLogs((prev) => [...prev, `[WS] Status sync failed: ${err.message}`]);
+    }
+  };
+
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
@@ -67,6 +111,7 @@ const Dashboard = () => {
 
       ws.onopen = () => {
         setLogs((prev) => [...prev, '[WS] Connected to pipeline server.']);
+        syncJobStatus(taskIdRef.current);
       };
 
       ws.onerror = () => {
@@ -95,26 +140,7 @@ const Dashboard = () => {
             }
           }
 
-          const nodeId = nodeMap[data.step];
-          if (nodeId) {
-            setNodes((nds) => nds.map((node) => {
-              if (node.id === nodeId) {
-                const ringColor = data.status === 'Running' ? '#60a5fa' : data.status === 'Success' ? '#10b981' : data.status === 'Failed' ? '#ef4444' : '#374151';
-                return {
-                  ...node,
-                  style: {
-                    background: '#1f2937',
-                    color: 'white',
-                    border: `2px solid ${ringColor}`,
-                    boxShadow: data.status === 'Running' ? `0 0 15px ${ringColor}` : 'none',
-                    borderRadius: '5px',
-                    padding: '10px'
-                  }
-                };
-              }
-              return node;
-            }));
-          }
+          applyNodeStatus(data.step, data.status);
 
           if ('vuln' in data) {
             setVulnData(data.vuln);

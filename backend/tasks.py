@@ -600,6 +600,9 @@ def _compile_harness_with_feedback(
             "The following C harness failed to compile. Fix the errors based on the "
             "compiler output and return only the corrected complete C code. Do not "
             "explain.\n\n"
+            "If the errors mention an undeclared '__afl_fuzz_ptr', '__afl_fuzz_len' "
+            "or '__afl_fuzz_alt_ptr', add __AFL_FUZZ_INIT(); at global scope "
+            "(outside any function, after the #include lines).\n\n"
             f"Compiler Output:\n{stderr_str}\n\n"
             "Original Target Source (for correct function signatures):\n"
             f"```c\n{truncate_for_prompt(vuln_code)}\n```\n\n"
@@ -608,7 +611,7 @@ def _compile_harness_with_feedback(
         fix_resp = call_llm_api(
             fix_prompt, model="gemini-2.5-flash", task_type="harness"
         )
-        harness_code = extract_c_code(fix_resp)
+        harness_code = _ensure_afl_fuzz_init(extract_c_code(fix_resp))
 
         with open(harness_path, "w") as f:
             f.write(harness_code)
@@ -833,7 +836,8 @@ def _run_ai_harness_stage(
     prompt = (
         "Write a complete C harness for AFL++ persistent mode targeting the "
         f"function(s) in this file: {sast.vuln_file}.\n"
-        f"Use __AFL_FUZZ_INIT(), a `while (__AFL_LOOP(1000))` loop, and read the test case from "
+        f"Place __AFL_FUZZ_INIT(); at global scope (after the #include lines, before main), "
+        f"use a `while (__AFL_LOOP(1000))` loop, and read the test case from "
         f"__AFL_FUZZ_TESTCASE_BUF / __AFL_FUZZ_TESTCASE_LEN. Define your own `int main()` "
         f"(do NOT define LLVMFuzzerTestOneInput). Call the vulnerable function so "
         "the crash is reachable.\n"
@@ -842,7 +846,7 @@ def _run_ai_harness_stage(
         f"Return ONLY the complete C harness inside a single ```c code block. Do not explain."
     )
     llm_resp = call_llm_api(prompt, model="gemini-2.5-flash", task_type="harness")
-    harness_code = extract_c_code(llm_resp)
+    harness_code = _ensure_afl_fuzz_init(extract_c_code(llm_resp))
     harness_path = os.path.join(context.repo_path, "harness.c")
     console.print(f"harness_path : {harness_path}")
     console.print(f"harness_code : {harness_code}")
@@ -1077,6 +1081,34 @@ def extract_c_code(llm_response):
         end = llm_response.find("```", start)
         return llm_response[start:end].strip()
     return llm_response.strip()
+
+
+def _ensure_afl_fuzz_init(harness_code: str) -> str:
+    """Guarantee ``__AFL_FUZZ_INIT();`` at global scope when the harness uses
+    AFL++ persistent-mode macros.
+
+    gemini-2.5-flash frequently emits ``__AFL_FUZZ_TESTCASE_BUF`` / ``_LEN``
+    without the required ``__AFL_FUZZ_INIT()`` declaration, which fails to
+    compile with ``use of undeclared identifier '__afl_fuzz_ptr'``. Inserting it
+    deterministically removes that whole class of flaky harness-compile failures
+    instead of relying on the LLM (or the retry loop) to remember it.
+    """
+    uses_persistent = (
+        "__AFL_FUZZ_TESTCASE_BUF" in harness_code
+        or "__AFL_FUZZ_TESTCASE_LEN" in harness_code
+    )
+    if not uses_persistent or "__AFL_FUZZ_INIT" in harness_code:
+        return harness_code
+
+    # Place the macro at global scope, just after the last #include (the AFL++
+    # convention); fall back to the top of the file if there are no includes.
+    lines = harness_code.splitlines()
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#include"):
+            insert_at = i + 1
+    lines.insert(insert_at, "__AFL_FUZZ_INIT();")
+    return "\n".join(lines)
 
 
 def _get_dev_llm_config() -> dict:

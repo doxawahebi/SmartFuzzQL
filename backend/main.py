@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ from tasks import (
     SAMPLE_REPOS,
     run_pipeline,
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="HAST Pipeline API")
 
@@ -240,13 +243,22 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: str):
-        await asyncio.gather(
-            *[conn.send_text(message) for conn in self.active_connections],
+        if not self.active_connections:
+            return
+        connections = list(self.active_connections)
+        results = await asyncio.gather(
+            *[conn.send_text(message) for conn in connections],
             return_exceptions=True,
         )
+        # Drop any connection that failed to receive so dead browser tabs do
+        # not accumulate and stall future broadcasts.
+        for conn, result in zip(connections, results):
+            if isinstance(result, Exception):
+                self.disconnect(conn)
 
 
 manager = ConnectionManager()
@@ -349,35 +361,73 @@ async def startup_event():
     database.init_db()
     url = os.environ.get('CELERY_BROKER_URL', 'redis://redis:6379/0')
     app.state.redis = redis.from_url(url)
-    app.state.pubsub = app.state.redis.pubsub()
-    await app.state.pubsub.subscribe("pipeline_logs")
-    asyncio.create_task(redis_listener())
+    app.state.relay_task = asyncio.create_task(redis_listener())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    task = getattr(app.state, "relay_task", None)
+    if task:
+        task.cancel()
+
+
+async def _close_pubsub(pubsub) -> None:
+    """Close a PubSub connection, releasing its Redis subscription."""
+    try:
+        await pubsub.aclose()
+    except Exception:
+        pass
 
 
 async def redis_listener():
+    """Relay every Redis ``pipeline_logs`` message to all connected /ws clients.
+
+    Owns the PubSub lifecycle so failures recover cleanly:
+      * messages are polled with ``get_message(timeout=...)``; an idle poll
+        returns ``None`` and keeps the *same* subscription alive, so no message
+        published between reconnects is ever missed;
+      * the subscription is always closed before reconnecting, so we never leak
+        Redis subscribers;
+      * only real connection errors reconnect, and each reconnect awaits a
+        backoff sleep — the loop can never busy-spin and starve the event loop
+        (the bug that froze the relay and made the dashboard go dead while the
+        worker kept running).
+    """
+    backoff = 1
     while True:
+        pubsub = app.state.redis.pubsub()
         try:
-            async for message in app.state.pubsub.listen():
-                if message["type"] == "message":
-                    raw = message["data"].decode("utf-8")
-                    try:
-                        payload = json.loads(raw)
-                        task_id = payload.get("task_id")
-                        if task_id and task_id in job_store:
-                            _update_job_store(task_id, payload)
-                            asyncio.get_event_loop().run_in_executor(
-                                None, _db_sync_update, task_id, payload
-                            )
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-                    await manager.broadcast(raw)
-        except Exception:
-            await asyncio.sleep(2)
-            try:
-                app.state.pubsub = app.state.redis.pubsub()
-                await app.state.pubsub.subscribe("pipeline_logs")
-            except Exception:
-                pass
+            await pubsub.subscribe("pipeline_logs")
+            logger.info("[relay] subscribed to Redis channel 'pipeline_logs'")
+            backoff = 1
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message is None:
+                    continue  # idle tick — no message yet, keep listening
+                raw = message["data"]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                try:
+                    payload = json.loads(raw)
+                    task_id = payload.get("task_id")
+                    if task_id and task_id in job_store:
+                        _update_job_store(task_id, payload)
+                        asyncio.get_running_loop().run_in_executor(
+                            None, _db_sync_update, task_id, payload
+                        )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                await manager.broadcast(raw)
+        except asyncio.CancelledError:
+            await _close_pubsub(pubsub)
+            raise
+        except Exception as exc:
+            logger.warning("[relay] Redis listener error: %r; reconnecting", exc)
+        await _close_pubsub(pubsub)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
 
 
 # ---------------------------------------------------------------------------

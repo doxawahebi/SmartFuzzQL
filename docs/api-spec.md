@@ -32,6 +32,26 @@ the bundled sample repositories (see Developer Lab Endpoints below).
 }
 ```
 
+**Review-mode request (optional)**
+```json
+{
+  "target_type": "repo",
+  "repo_url": "https://github.com/example/vulnerable-repo",
+  "review_mode": true
+}
+```
+
+For inline C/C++ source review:
+```json
+{
+  "target_type": "source",
+  "source_code": "void f(char *s) { char b[8]; strcpy(b, s); }",
+  "review_mode": true
+}
+```
+
+When `review_mode=true`, the backend enqueues stage-specific Celery tasks and pauses for review after `SAST`, `AI_HARNESS`, `DAST`, and `AI_PATCH`.
+
 **Response 503** — the Celery broker is unavailable and the job could not be queued.
 
 ---
@@ -67,6 +87,13 @@ Get the current status and enriched results for a specific job.
 {
   "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "state": "SUCCESS",
+  "repo_url": "https://github.com/example/vulnerable-repo",
+  "target_type": "repo",
+  "review_mode": true,
+  "current_stage": "AI_PATCH",
+  "review_state": "waiting",
+  "stage_artifacts": {},
+  "failure_detail": null,
   "vuln": {
     "message": "Potential buffer overflow",
     "file": "src/main.c",
@@ -92,6 +119,72 @@ Get the current status and enriched results for a specific job.
 
 ---
 
+### POST /api/jobs/{task_id}/review/approve
+
+Approve the current waiting review stage and enqueue the next stage.
+
+**Request body**
+```json
+{
+  "stage": "SAST"
+}
+```
+
+`stage` is optional for older callers. When present, it must match the server-side waiting stage or the API returns `409`.
+
+**Response 200**
+```json
+{
+  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "approved_stage": "SAST",
+  "next_stage": "AI_HARNESS",
+  "review_state": "approved"
+}
+```
+
+**Response 409** when the job is not waiting for review.
+
+---
+
+### POST /api/jobs/{task_id}/review/retry
+
+Discard the current stage and downstream review artifacts, then enqueue the same stage again.
+
+**Request body**
+```json
+{
+  "stage": "DAST"
+}
+```
+
+`stage` is optional for older callers. When present, it must match the server-side waiting stage or the API returns `409`.
+
+**Response 200**
+```json
+{
+  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "retry_stage": "DAST",
+  "review_state": "retrying"
+}
+```
+
+---
+
+### POST /api/jobs/{task_id}/cancel
+
+Mark an active job as cancelled, persist `FAILURE`, and best-effort cleanup runtime workspace and fuzzing image.
+
+**Response 200**
+```json
+{
+  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "state": "FAILURE",
+  "review_state": "cancelled"
+}
+```
+
+---
+
 ## WebSocket
 
 ### WS /ws
@@ -113,6 +206,17 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
   "step":    "INIT | SAST | AI_HARNESS | DAST | AI_PATCH | DB_STORAGE | ENV_GEN | PIPELINE",
   "status":  "Running | Success | Failed | Warning",
   "details": "string | null",
+  "current_stage": "string | null",
+  "review_state": "queued | running | waiting | approved | retrying | completed | failed | cancelled",
+  "artifact": {},
+  "compile_feedback": {
+    "compile_attempt": 2,
+    "max_attempts": 3,
+    "stderr_excerpt": "compiler stderr excerpt",
+    "llm_retry": true,
+    "compiled": true
+  },
+  "severity": "High | Medium | Low",
 
   "error_hint": "string (actionable remediation hint; only on PIPELINE / Failed)",
 

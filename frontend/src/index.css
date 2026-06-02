@@ -8,7 +8,8 @@
 }
 
 .review-prototype-card {
-  animation: review-prototype-card-enter 180ms ease-out;
+  animation: review-prototype-card-enter 260ms ease-out both;
+  animation-delay: 90ms;
 }
 
 @keyframes review-prototype-card-enter {

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime, timezone
 
@@ -20,7 +21,13 @@ from tasks import (
     ALLOWED_GEMINI_MODELS,
     DEFAULT_GEMINI_MODEL,
     DEV_LLM_CONFIG_KEY,
+    REVIEW_DOWNSTREAM,
+    REVIEW_STAGE_ORDER,
     SAMPLE_REPOS,
+    cleanup_review_runtime,
+    enqueue_review_stage,
+    notify_status,
+    prepare_review_workspace,
     run_pipeline,
 )
 
@@ -42,8 +49,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 class JobRequest(BaseModel):
-    repo_url: str
+    repo_url: str | None = None
     submitted_by: str | None = None
+    target_type: str = "repo"
+    source_code: str | None = None
+    review_mode: bool = False
 
 
 class VulnFinding(BaseModel):
@@ -73,6 +83,17 @@ class JobStatusResponse(BaseModel):
     state: str
     vuln: VulnFinding | None = None
     result: PipelineResult | None = None
+    repo_url: str | None = None
+    target_type: str = "repo"
+    review_mode: bool = False
+    current_stage: str | None = None
+    review_state: str | None = None
+    stage_artifacts: dict | None = None
+    failure_detail: str | None = None
+
+
+class ReviewActionRequest(BaseModel):
+    stage: str | None = None
 
 
 class DevLlmSettingsRequest(BaseModel):
@@ -269,6 +290,7 @@ manager = ConnectionManager()
 # ---------------------------------------------------------------------------
 
 def _update_job_store(task_id: str, payload: dict) -> None:
+    job_store.setdefault(task_id, {"task_id": task_id})
     step = payload.get("step")
     status = payload.get("status")
     if step == "INIT" and status == "Running":
@@ -281,6 +303,14 @@ def _update_job_store(task_id: str, payload: dict) -> None:
         job_store[task_id]["vuln"] = payload["vuln"]
     if "result" in payload and payload["result"] is not None:
         job_store[task_id]["result"] = payload["result"]
+    for key in ("current_stage", "review_state", "failure_detail", "severity"):
+        if key in payload:
+            job_store[task_id][key] = payload[key]
+    if payload.get("artifact"):
+        artifacts = dict(job_store[task_id].get("stage_artifacts") or {})
+        stage_key = payload.get("current_stage") or step
+        artifacts[stage_key] = payload["artifact"]
+        job_store[task_id]["stage_artifacts"] = artifacts
 
 
 def _job_store_entry_from_db(job: Job) -> dict:
@@ -315,6 +345,12 @@ def _job_store_entry_from_db(job: Job) -> dict:
         ),
         "vuln": vuln,
         "result": result,
+        "target_type": job.target_type or "repo",
+        "review_mode": bool(job.review_mode),
+        "current_stage": job.current_stage,
+        "review_state": job.review_state,
+        "stage_artifacts": job.stage_artifacts or {},
+        "failure_detail": job.failure_detail,
     }
 
 
@@ -345,6 +381,17 @@ def _db_sync_update(task_id: str, payload: dict) -> None:
             job.patch_generated = r.get("patch_generated")
             job.crash_hex = r.get("crash_hex")
             job.patch_code = r.get("patch_code")
+        if payload.get("current_stage") is not None:
+            job.current_stage = payload.get("current_stage")
+        if payload.get("review_state") is not None:
+            job.review_state = payload.get("review_state")
+        if payload.get("failure_detail") is not None:
+            job.failure_detail = payload.get("failure_detail")
+        if payload.get("artifact"):
+            artifacts = dict(job.stage_artifacts or {})
+            stage_key = payload.get("current_stage") or step
+            artifacts[stage_key] = payload["artifact"]
+            job.stage_artifacts = artifacts
         db.commit()
     except Exception:
         db.rollback()
@@ -412,8 +459,9 @@ async def redis_listener():
                 try:
                     payload = json.loads(raw)
                     task_id = payload.get("task_id")
-                    if task_id and task_id in job_store:
-                        _update_job_store(task_id, payload)
+                    if task_id:
+                        if task_id in job_store:
+                            _update_job_store(task_id, payload)
                         asyncio.get_running_loop().run_in_executor(
                             None, _db_sync_update, task_id, payload
                         )
@@ -502,7 +550,7 @@ async def update_dev_llm_settings(settings: DevLlmSettingsRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/jobs")
-async def submit_job(job: JobRequest):
+async def submit_job(job: JobRequest, db: Session = Depends(get_db)):
     """
     POST /api/jobs
 
@@ -517,34 +565,68 @@ async def submit_job(job: JobRequest):
         message  (str) Confirmation message
         task_id  (str) UUID of the queued job
     """
+    target_type = job.target_type or "repo"
+    if target_type not in {"repo", "source"}:
+        raise HTTPException(status_code=400, detail="target_type must be repo or source")
+    if target_type == "repo" and not job.repo_url:
+        raise HTTPException(status_code=400, detail="repo_url is required for repo targets")
+    if target_type == "source" and not job.source_code:
+        raise HTTPException(status_code=400, detail="source_code is required for source targets")
+
     task_id = str(uuid.uuid4())
+    repo_url = job.repo_url.strip() if job.repo_url else f"inline://{task_id}"
+    workspace_path = None
+    if job.review_mode:
+        workspace_path = prepare_review_workspace(
+            task_id,
+            target_type=target_type,
+            source_code=job.source_code,
+        )
+
     job_store[task_id] = {
         "task_id": task_id,
         "state": "PENDING",
-        "repo_url": job.repo_url,
+        "repo_url": repo_url,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "vuln": None,
         "result": None,
+        "target_type": target_type,
+        "review_mode": job.review_mode,
+        "current_stage": "INIT" if job.review_mode else None,
+        "review_state": "queued" if job.review_mode else None,
+        "stage_artifacts": {},
+        "failure_detail": None,
     }
 
-    db = SessionLocal()
     try:
         db_job = Job(
             task_id=task_id,
-            repo_url=job.repo_url,
+            repo_url=repo_url,
             submitted_by=job.submitted_by,
             state="PENDING",
             submitted_at=datetime.utcnow(),
+            review_mode=job.review_mode,
+            target_type=target_type,
+            workspace_path=workspace_path,
+            current_stage="INIT" if job.review_mode else None,
+            review_state="queued" if job.review_mode else None,
+            stage_results={},
+            stage_artifacts={},
         )
         db.add(db_job)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
-    finally:
-        db.close()
+        if workspace_path:
+            shutil.rmtree(workspace_path, ignore_errors=True)
+        if job.review_mode:
+            raise HTTPException(status_code=500, detail=f"Failed to persist review job: {exc}")
 
     try:
-        run_pipeline.apply_async((job.repo_url,), task_id=task_id)
+        if job.review_mode:
+            enqueue_review_stage(task_id, "INIT")
+        else:
+            run_pipeline.apply_async((repo_url,), task_id=task_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Celery broker unavailable: {exc}")
     return {"message": "Job submitted successfully", "task_id": task_id}
@@ -581,7 +663,184 @@ def get_job(task_id: str, db: Session = Depends(get_db)):
         state=entry["state"],
         vuln=vuln,
         result=result,
+        repo_url=entry.get("repo_url"),
+        target_type=entry.get("target_type") or "repo",
+        review_mode=bool(entry.get("review_mode")),
+        current_stage=entry.get("current_stage"),
+        review_state=entry.get("review_state"),
+        stage_artifacts=entry.get("stage_artifacts") or {},
+        failure_detail=entry.get("failure_detail"),
     )
+
+
+def _review_result_key(stage: str) -> str:
+    return {
+        "SAST": "sast",
+        "AI_HARNESS": "harness",
+        "DAST": "dast",
+        "AI_PATCH": "patch",
+    }.get(stage, stage.lower())
+
+
+def _require_waiting_review_job(
+    task_id: str,
+    db: Session,
+    expected_stage: str | None = None,
+) -> Job:
+    job = db.query(Job).filter(Job.task_id == task_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.review_mode:
+        raise HTTPException(status_code=400, detail="Job is not running in review mode")
+    if job.review_state != "waiting" or not job.current_stage:
+        raise HTTPException(status_code=409, detail="Job is not waiting for review")
+    if job.current_stage not in REVIEW_STAGE_ORDER:
+        raise HTTPException(status_code=409, detail="Current stage is not reviewable")
+    if expected_stage and job.current_stage != expected_stage:
+        raise HTTPException(status_code=409, detail="Review stage mismatch")
+    return job
+
+
+def _clear_downstream_review_data(job: Job, stage: str) -> None:
+    stages = REVIEW_DOWNSTREAM.get(stage, (stage,))
+    results = dict(job.stage_results or {})
+    artifacts = dict(job.stage_artifacts or {})
+    for downstream in stages:
+        results.pop(_review_result_key(downstream), None)
+        artifacts.pop(downstream, None)
+    job.stage_results = results
+    job.stage_artifacts = artifacts
+
+    if stage == "SAST":
+        job.vuln_message = None
+        job.vuln_file = None
+        job.code_snippet = None
+        job.original_code = None
+        job.taint_path = None
+        job.call_path = None
+    if stage in {"SAST", "AI_HARNESS", "DAST"}:
+        job.crash_hex = None
+    if stage in {"SAST", "AI_HARNESS", "DAST", "AI_PATCH"}:
+        job.patch_generated = None
+        job.patch_code = None
+    job.completed_at = None
+    job.failure_detail = None
+
+
+def _cleanup_retry_workspace_artifacts(job: Job, stage: str) -> None:
+    workspace_path = job.workspace_path
+    if not workspace_path:
+        return
+    if stage == "SAST":
+        shutil.rmtree(os.path.join(workspace_path, "my-db"), ignore_errors=True)
+        for filename in ("results.sarif", "callgraph.sarif"):
+            try:
+                os.remove(os.path.join(workspace_path, filename))
+            except FileNotFoundError:
+                pass
+    if stage in {"SAST", "AI_HARNESS", "DAST"}:
+        shutil.rmtree(os.path.join(workspace_path, "outputs"), ignore_errors=True)
+        shutil.rmtree(os.path.join(workspace_path, "inputs"), ignore_errors=True)
+
+
+@app.post("/api/jobs/{task_id}/review/approve")
+def approve_review_stage(
+    task_id: str,
+    review: ReviewActionRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    job = _require_waiting_review_job(task_id, db, review.stage if review else None)
+    current_stage = job.current_stage
+    next_stage = REVIEW_STAGE_ORDER[current_stage]
+    job.review_state = "approved"
+    job.failure_detail = None
+    db.commit()
+
+    notify_status(
+        task_id,
+        current_stage,
+        "Success",
+        f"Review approved for {current_stage}",
+        extra={"current_stage": current_stage, "review_state": "approved"},
+    )
+    try:
+        enqueue_review_stage(task_id, next_stage)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Celery broker unavailable: {exc}")
+    return {
+        "task_id": task_id,
+        "approved_stage": current_stage,
+        "next_stage": next_stage,
+        "review_state": "approved",
+    }
+
+
+@app.post("/api/jobs/{task_id}/review/retry")
+def retry_review_stage(
+    task_id: str,
+    review: ReviewActionRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    job = _require_waiting_review_job(task_id, db, review.stage if review else None)
+    current_stage = job.current_stage
+    _clear_downstream_review_data(job, current_stage)
+    _cleanup_retry_workspace_artifacts(job, current_stage)
+    job.state = "STARTED"
+    job.review_state = "retrying"
+    db.commit()
+
+    notify_status(
+        task_id,
+        current_stage,
+        "Running",
+        f"Retry requested for {current_stage}",
+        extra={"current_stage": current_stage, "review_state": "retrying"},
+    )
+    try:
+        enqueue_review_stage(task_id, current_stage)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Celery broker unavailable: {exc}")
+    return {
+        "task_id": task_id,
+        "retry_stage": current_stage,
+        "review_state": "retrying",
+    }
+
+
+@app.post("/api/jobs/{task_id}/cancel")
+def cancel_job(task_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.task_id == task_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state == "SUCCESS":
+        raise HTTPException(status_code=409, detail="Completed jobs cannot be cancelled")
+
+    job.state = "FAILURE"
+    job.review_state = "cancelled"
+    job.failure_detail = "Pipeline cancelled by user"
+    job.completed_at = datetime.utcnow()
+    workspace_path = job.workspace_path
+    current_stage = job.current_stage
+    db.commit()
+
+    if workspace_path:
+        shutil.rmtree(workspace_path, ignore_errors=True)
+    try:
+        cleanup_review_runtime.apply_async((task_id, workspace_path))
+    except Exception:
+        pass
+    notify_status(
+        task_id,
+        "PIPELINE",
+        "Failed",
+        "Pipeline cancelled by user",
+        extra={
+            "current_stage": current_stage,
+            "review_state": "cancelled",
+            "failure_detail": "Pipeline cancelled by user",
+        },
+    )
+    return {"task_id": task_id, "state": "FAILURE", "review_state": "cancelled"}
 
 
 # ---------------------------------------------------------------------------

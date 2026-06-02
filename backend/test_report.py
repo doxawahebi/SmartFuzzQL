@@ -36,14 +36,15 @@ def client():
 
 
 def _seed_job(db, task_id: str, state: str = "SUCCESS", **kwargs):
-    job = Job(
-        task_id=task_id,
-        repo_url="https://github.com/example/repo",
-        state=state,
-        vuln_message="Potential buffer overflow",
-        vuln_file="src/vuln.c",
-        **kwargs,
-    )
+    fields = {
+        "task_id": task_id,
+        "repo_url": "https://github.com/example/repo",
+        "state": state,
+        "vuln_message": "Potential buffer overflow",
+        "vuln_file": "src/vuln.c",
+    }
+    fields.update(kwargs)
+    job = Job(**fields)
     db.add(job)
     db.commit()
     return job

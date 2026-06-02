@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from celery import Celery
 import collections
 import queue
@@ -17,7 +19,7 @@ import requests
 import io
 import sys
 import tarfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 
 # Ensure this backend directory is importable by absolute path. The Celery worker's
@@ -66,6 +68,353 @@ SAMPLE_REPOS = {
         "path": os.path.join(_BACKEND_DIR, "debug_samples", "buffer_overflow_repo"),
     }
 }
+INLINE_REPO_PREFIX = "inline://"
+REVIEW_STAGES = ("SAST", "AI_HARNESS", "DAST", "AI_PATCH")
+REVIEW_STAGE_ORDER = {
+    "SAST": "AI_HARNESS",
+    "AI_HARNESS": "DAST",
+    "DAST": "AI_PATCH",
+    "AI_PATCH": "DB_STORAGE",
+}
+REVIEW_DOWNSTREAM = {
+    "SAST": ("SAST", "AI_HARNESS", "DAST", "AI_PATCH", "DB_STORAGE", "PIPELINE"),
+    "AI_HARNESS": ("AI_HARNESS", "DAST", "AI_PATCH", "DB_STORAGE", "PIPELINE"),
+    "DAST": ("DAST", "AI_PATCH", "DB_STORAGE", "PIPELINE"),
+    "AI_PATCH": ("AI_PATCH", "DB_STORAGE", "PIPELINE"),
+}
+
+
+def is_inline_repo_url(repo_url: str) -> bool:
+    return bool(repo_url and repo_url.startswith(INLINE_REPO_PREFIX))
+
+
+def review_workspace_root() -> str:
+    return os.environ.get(
+        "PIPELINE_WORKSPACE_ROOT",
+        os.path.join(_BACKEND_DIR, ".runtime", "workspaces"),
+    )
+
+
+def review_workspace_path(task_id: str) -> str:
+    return os.path.join(review_workspace_root(), task_id)
+
+
+def prepare_review_workspace(
+    task_id: str,
+    target_type: str = "repo",
+    source_code: str | None = None,
+) -> str:
+    workspace = review_workspace_path(task_id)
+    shutil.rmtree(workspace, ignore_errors=True)
+    os.makedirs(workspace, exist_ok=True)
+    if target_type == "source":
+        source_path = os.path.join(workspace, "inline_source.c")
+        with open(source_path, "w", encoding="utf-8") as f:
+            f.write(source_code or "")
+    return workspace
+
+
+def _db_session():
+    from database import SessionLocal
+
+    return SessionLocal()
+
+
+def _load_job(task_id: str):
+    from models import Job as JobModel
+
+    db = _db_session()
+    job = db.query(JobModel).filter(JobModel.task_id == task_id).first()
+    if not job:
+        db.close()
+        raise RuntimeError(f"Job not found: {task_id}")
+    return db, job
+
+
+def _json_dict(value) -> dict:
+    return dict(value or {})
+
+
+def _stage_key(stage: str) -> str:
+    return {
+        "SAST": "sast",
+        "AI_HARNESS": "harness",
+        "DAST": "dast",
+        "AI_PATCH": "patch",
+    }.get(stage, stage.lower())
+
+
+def _set_review_job(task_id: str, **fields) -> None:
+    db, job = _load_job(task_id)
+    try:
+        for key, value in fields.items():
+            setattr(job, key, value)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _merge_review_payload(
+    task_id: str,
+    *,
+    stage: str | None = None,
+    result: dict | None = None,
+    artifact: dict | None = None,
+    **fields,
+) -> None:
+    db, job = _load_job(task_id)
+    try:
+        if stage and result is not None:
+            results = _json_dict(job.stage_results)
+            results[_stage_key(stage)] = result
+            job.stage_results = results
+        if stage and artifact is not None:
+            artifacts = _json_dict(job.stage_artifacts)
+            artifacts[stage] = artifact
+            job.stage_artifacts = artifacts
+        for key, value in fields.items():
+            setattr(job, key, value)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _load_stage_results(task_id: str) -> dict:
+    db, job = _load_job(task_id)
+    try:
+        return _json_dict(job.stage_results)
+    finally:
+        db.close()
+
+
+def _load_review_context(task_id: str) -> PipelineContext:
+    db, job = _load_job(task_id)
+    try:
+        workspace = job.workspace_path or review_workspace_path(task_id)
+        return PipelineContext(
+            task_id=task_id,
+            repo_url=job.repo_url,
+            temp_dir=workspace,
+            repo_path=workspace,
+        )
+    finally:
+        db.close()
+
+
+def _is_review_cancelled(task_id: str) -> bool:
+    db, job = _load_job(task_id)
+    try:
+        return job.review_state == "cancelled"
+    finally:
+        db.close()
+
+
+def _stage_running(task_id: str, stage: str, details: str) -> None:
+    _merge_review_payload(
+        task_id,
+        current_stage=stage,
+        review_state="running",
+        state="STARTED",
+        failure_detail=None,
+    )
+    notify_status(
+        task_id,
+        stage,
+        "Running",
+        details,
+        extra={"current_stage": stage, "review_state": "running"},
+    )
+
+
+def _stage_waiting(task_id: str, stage: str, artifact: dict) -> None:
+    _merge_review_payload(
+        task_id,
+        stage=stage,
+        artifact=artifact,
+        current_stage=stage,
+        review_state="waiting",
+    )
+    extra = {
+        "current_stage": stage,
+        "review_state": "waiting",
+        "artifact": artifact,
+    }
+    if artifact.get("severity"):
+        extra["severity"] = artifact["severity"]
+    if artifact.get("compile_feedback"):
+        extra["compile_feedback"] = artifact["compile_feedback"]
+    notify_status(
+        task_id,
+        stage,
+        "Success",
+        f"{stage} artifact ready for review",
+        extra=extra,
+    )
+
+
+def _fail_review_stage(task_id: str, stage: str, error: Exception) -> None:
+    hint = error.hint if isinstance(error, PipelineUserError) else None
+    failure_detail = str(error)
+    _merge_review_payload(
+        task_id,
+        current_stage=stage,
+        review_state="failed",
+        state="FAILURE",
+        completed_at=datetime.utcnow(),
+        failure_detail=failure_detail,
+    )
+    extra = {
+        "current_stage": stage,
+        "review_state": "failed",
+        "failure_detail": failure_detail,
+    }
+    if hint:
+        extra["error_hint"] = hint
+    notify_status(task_id, "PIPELINE", "Failed", failure_detail, extra=extra)
+
+
+def _severity_from_result(result: dict | None) -> str:
+    if not result:
+        return "High"
+    raw = (
+        result.get("level")
+        or result.get("properties", {}).get("problem.severity")
+        or result.get("properties", {}).get("security-severity")
+    )
+    if raw is None:
+        return "High"
+    text = str(raw).lower()
+    if text in {"error", "high", "critical"}:
+        return "High"
+    if text in {"warning", "medium", "moderate"}:
+        return "Medium"
+    if text in {"note", "low", "recommendation"}:
+        return "Low"
+    try:
+        score = float(text)
+        if score >= 7:
+            return "High"
+        if score >= 4:
+            return "Medium"
+        return "Low"
+    except ValueError:
+        return "High"
+
+
+def _sast_result_to_dict(sast: SastStageResult) -> dict:
+    return {
+        "vuln_msg": sast.vuln_msg,
+        "vuln_file": sast.vuln_file,
+        "vuln_line": sast.vuln_line,
+        "vuln_code": sast.vuln_code,
+        "results": sast.results,
+        "call_edge_results": sast.call_edge_results,
+    }
+
+
+def _sast_result_from_dict(data: dict) -> SastStageResult:
+    return SastStageResult(
+        vuln_msg=data.get("vuln_msg", ""),
+        vuln_file=data.get("vuln_file", ""),
+        vuln_line=data.get("vuln_line"),
+        vuln_code=data.get("vuln_code", CODE_NOT_FOUND),
+        results=data.get("results") or [],
+        call_edge_results=data.get("call_edge_results") or [],
+    )
+
+
+def _harness_result_to_dict(harness: HarnessStageResult) -> dict:
+    return asdict(harness)
+
+
+def _harness_result_from_dict(data: dict) -> HarnessStageResult:
+    return HarnessStageResult(
+        harness_code=data.get("harness_code", ""),
+        harness_path=data.get("harness_path", ""),
+    )
+
+
+def _dast_result_to_dict(dast: DastStageResult) -> dict:
+    return {
+        "crash_hex": dast.crash_data.hex() if dast.crash_data else None,
+        "compile_feedback": dast.compile_feedback or {},
+        "fuzz_stats": dast.fuzz_stats or [],
+    }
+
+
+def _dast_result_from_dict(data: dict) -> DastStageResult:
+    crash_hex = data.get("crash_hex")
+    return DastStageResult(
+        crash_data=bytes.fromhex(crash_hex) if crash_hex else None,
+        compile_feedback=data.get("compile_feedback") or {},
+        fuzz_stats=data.get("fuzz_stats") or [],
+    )
+
+
+def _patch_result_to_dict(patch_result: PatchStageResult) -> dict:
+    return asdict(patch_result)
+
+
+def _patch_result_from_dict(data: dict) -> PatchStageResult:
+    return PatchStageResult(patch_code=data.get("patch_code", ""))
+
+
+def _sast_artifact(sast: SastStageResult) -> dict:
+    taint_result = _select_taint_result(sast)
+    taint_path = _extract_taint_path(taint_result) if taint_result else {"nodes": [], "edges": []}
+    sink_line = taint_path["nodes"][-1]["start_line"] if taint_path["nodes"] else 0
+    call_path = _extract_call_path(
+        sast.call_edge_results,
+        vuln_result=taint_result,
+        sink_line=sink_line,
+    )
+    return {
+        "type": "sast",
+        "title": "SAST Findings",
+        "severity": _severity_from_result(taint_result),
+        "rule_id": taint_result.get("ruleId") if taint_result else None,
+        "message": sast.vuln_msg,
+        "file": sast.vuln_file,
+        "line": sast.vuln_line,
+        "code_snippet": _code_snippet_or_none(sast.vuln_code),
+        "taint_path": taint_path,
+        "call_path": call_path,
+    }
+
+
+def _harness_artifact(harness: HarnessStageResult) -> dict:
+    return {
+        "type": "harness",
+        "title": "Generated Harness",
+        "harness_code": harness.harness_code,
+        "harness_path": harness.harness_path,
+    }
+
+
+def _dast_artifact(dast: DastStageResult) -> dict:
+    return {
+        "type": "crash",
+        "title": "Crash Evidence",
+        "crash_hex": dast.crash_data.hex() if dast.crash_data else None,
+        "compile_feedback": dast.compile_feedback or {},
+        "fuzz_stats": dast.fuzz_stats or [],
+    }
+
+
+def _patch_artifact(patch_result: PatchStageResult) -> dict:
+    preview_lines = (patch_result.patch_code or "").splitlines()
+    return {
+        "type": "patch",
+        "title": "Patch Proposal",
+        "patch_code": patch_result.patch_code,
+        "diff_preview": "\n".join(preview_lines[:80]),
+    }
 
 
 class PipelineUserError(RuntimeError):
@@ -101,6 +450,8 @@ class HarnessStageResult:
 @dataclass
 class DastStageResult:
     crash_data: bytes | None
+    compile_feedback: dict | None = None
+    fuzz_stats: list | None = None
 
 
 @dataclass
@@ -331,6 +682,15 @@ def _extract_call_path(
 
 def clone_repo(task_id, repo_url, temp_dir):
     """Shallow-clone the target repository into temp_dir. Raises on failure."""
+    if is_inline_repo_url(repo_url):
+        notify_status(
+            task_id,
+            "INIT",
+            "Running",
+            f"Using inline source workspace {temp_dir}",
+        )
+        return
+
     if is_sample_repo_url(repo_url):
         notify_status(
             task_id,
@@ -484,17 +844,19 @@ def run_dast_fuzzing(
     task_id, repo_url, repo_path, harness_code, harness_path, vuln_code=""
 ):
     """Build a per-job fuzzing image, compile the harness (LLM feedback loop), fuzz with
-    AFL++, and return the crash input bytes. Raises on build/compile failure or timeout.
+    AFL++, and return crash plus review metadata. Raises on build/compile failure or timeout.
     """
     container = None
     try:
         container = _start_fuzzing_container(task_id, repo_url)
-        _compile_harness_with_feedback(
+        compile_feedback = _compile_harness_with_feedback(
             task_id, container, harness_code, harness_path, vuln_code
         )
-        return _run_afl_and_wait_for_crash(task_id, container)
+        crash_data, fuzz_stats = _run_afl_and_wait_for_crash(task_id, container)
+        return crash_data, compile_feedback, fuzz_stats
     finally:
         _cleanup_container(container)
+        _cleanup_fuzzer_image(task_id)
 
 
 def _cleanup_container(container):
@@ -505,6 +867,16 @@ def _cleanup_container(container):
         container.remove(force=True)
     except Exception as e:
         console.print(f"[red]Failed to cleanup container: {e}[/red]")
+
+
+def _cleanup_fuzzer_image(task_id: str):
+    image_name = f"dynamic-fuzzer-{task_id}"
+    try:
+        docker_client = docker.from_env()
+        docker_client.images.remove(image=image_name, force=True, noprune=False)
+        notify_status(task_id, "ENV_GEN", "Success", f"Removed fuzzing image {image_name}")
+    except Exception as e:
+        console.print(f"[yellow]Failed to cleanup image {image_name}: {e}[/yellow]")
 
 
 def _start_fuzzing_container(task_id, repo_url):
@@ -548,19 +920,35 @@ def _compile_harness_with_feedback(
     )
     max_compile_retries = 3
     compile_success = False
+    feedback = {
+        "compile_attempt": 0,
+        "max_attempts": max_compile_retries,
+        "stderr_excerpt": None,
+        "llm_retry": False,
+        "compiled": False,
+    }
 
     for attempt in range(1, max_compile_retries + 1):
+        feedback["compile_attempt"] = attempt
         notify_status(
             task_id,
             "DAST",
             "Running",
             f"Compiling harness (Attempt {attempt}/{max_compile_retries})...",
+            extra={"compile_feedback": dict(feedback)},
         )
         compile_res = container.exec_run(compile_cmd, user="root", demux=True)
 
         if compile_res.exit_code == 0:
             compile_success = True
-            notify_status(task_id, "DAST", "Success", "Harness compiled successfully.")
+            feedback["compiled"] = True
+            notify_status(
+                task_id,
+                "DAST",
+                "Success",
+                "Harness compiled successfully.",
+                extra={"compile_feedback": dict(feedback)},
+            )
             break
 
         # When demux=True is set, compile_res.output returns a
@@ -576,6 +964,7 @@ def _compile_harness_with_feedback(
             if stderr_bytes
             else "No STDERR"
         )
+        feedback["stderr_excerpt"] = stderr_str[-1200:]
 
         error_msg = (
             f"Failed to compile harness!\n"
@@ -590,11 +979,13 @@ def _compile_harness_with_feedback(
 
         if attempt == max_compile_retries:
             raise Exception(error_msg)
+        feedback["llm_retry"] = True
         notify_status(
             task_id,
             "DAST",
             "Warning",
             "Compilation failed. Requesting quick fix from LLM...",
+            extra={"compile_feedback": dict(feedback)},
         )
         fix_prompt = (
             "The following C harness failed to compile. Fix the errors based on the "
@@ -619,6 +1010,7 @@ def _compile_harness_with_feedback(
 
     if not compile_success:
         raise Exception("Failed to compile harness after maximum retries.")
+    return feedback
 
 
 def _parse_afl_stats(stats_str: str) -> dict:
@@ -685,6 +1077,7 @@ def _run_afl_and_wait_for_crash(task_id, container):
     start = time.time()
     crash_found = False
     crash_data = None
+    fuzz_stats_history = []
 
     while time.time() - start < timeout:
         console.print(
@@ -693,12 +1086,14 @@ def _run_afl_and_wait_for_crash(task_id, container):
         stats = container.exec_run("cat outputs/default/fuzzer_stats", user="root")
         if stats.exit_code == 0:
             stats_str = stats.output.decode("utf-8")
+            parsed_stats = _parse_afl_stats(stats_str)
+            fuzz_stats_history.append(parsed_stats)
             notify_status(
                 task_id,
                 "DAST",
                 "Running",
                 f"Fuzzer running... Stats:\n{stats_str[:200]}...",
-                extra={"fuzz_stats": _parse_afl_stats(stats_str)},
+                extra={"fuzz_stats": parsed_stats},
             )
         else:
             console.print(
@@ -721,7 +1116,7 @@ def _run_afl_and_wait_for_crash(task_id, container):
     if not crash_found:
         notify_status(task_id, "DAST", "Failed", "No crash found within timeout")
         raise Exception("Timeout reached without finding crash")
-    return crash_data
+    return crash_data, fuzz_stats_history
 
 
 def _run_initialization_stage(context: PipelineContext):
@@ -864,7 +1259,7 @@ def _run_dast_stage(
         "Running",
         "Fuzzing via isolated container against generated harness (max 20 mins)",
     )
-    crash_data = run_dast_fuzzing(
+    dast_output = run_dast_fuzzing(
         context.task_id,
         context.repo_url,
         context.repo_path,
@@ -872,7 +1267,16 @@ def _run_dast_stage(
         harness.harness_path,
         sast.vuln_code,
     )
-    return DastStageResult(crash_data=crash_data)
+    if isinstance(dast_output, DastStageResult):
+        return dast_output
+    if isinstance(dast_output, tuple):
+        crash_data, compile_feedback, fuzz_stats = dast_output
+        return DastStageResult(
+            crash_data=crash_data,
+            compile_feedback=compile_feedback,
+            fuzz_stats=fuzz_stats,
+        )
+    return DastStageResult(crash_data=dast_output)
 
 
 def _run_ai_patch_stage(
@@ -1031,6 +1435,199 @@ def _mark_pipeline_failed(task_id: str):
 @celery_app.task(bind=True)
 def run_pipeline(self, repo_url: str):
     return _run_pipeline_impl(self.request.id, repo_url)
+
+
+@celery_app.task(bind=True)
+def run_review_init_stage(self, task_id: str):
+    stage = "INIT"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        _stage_running(task_id, stage, "Preparing review-mode target workspace")
+        _run_initialization_stage(context)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        notify_status(
+            task_id,
+            stage,
+            "Success",
+            "Target workspace ready",
+            extra={"current_stage": "SAST", "review_state": "running"},
+        )
+        _merge_review_payload(task_id, current_stage="SAST", review_state="running")
+        run_review_sast_stage.apply_async((task_id,))
+        return {"status": "queued", "next_stage": "SAST"}
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def run_review_sast_stage(self, task_id: str):
+    stage = "SAST"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        _stage_running(task_id, stage, "Running CodeQL source-level analysis")
+        sast = _run_sast_stage(context)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        artifact = _sast_artifact(sast)
+        _merge_review_payload(
+            task_id,
+            stage=stage,
+            result=_sast_result_to_dict(sast),
+            vuln_message=sast.vuln_msg,
+            vuln_file=sast.vuln_file,
+            code_snippet=_code_snippet_or_none(sast.vuln_code),
+            original_code=sast.vuln_code if sast.vuln_code != CODE_NOT_FOUND else None,
+            taint_path=artifact["taint_path"],
+            call_path=artifact["call_path"],
+        )
+        _stage_waiting(task_id, stage, artifact)
+        return {"status": "waiting", "stage": stage}
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def run_review_harness_stage(self, task_id: str):
+    stage = "AI_HARNESS"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        results = _load_stage_results(task_id)
+        sast = _sast_result_from_dict(results.get("sast") or {})
+        _stage_running(task_id, stage, "Generating AFL++ harness with LLM")
+        harness = _run_ai_harness_stage(context, sast)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        artifact = _harness_artifact(harness)
+        _merge_review_payload(
+            task_id,
+            stage=stage,
+            result=_harness_result_to_dict(harness),
+        )
+        _stage_waiting(task_id, stage, artifact)
+        return {"status": "waiting", "stage": stage}
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def run_review_dast_stage(self, task_id: str):
+    stage = "DAST"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        results = _load_stage_results(task_id)
+        sast = _sast_result_from_dict(results.get("sast") or {})
+        harness = _harness_result_from_dict(results.get("harness") or {})
+        _stage_running(task_id, stage, "Verifying crash with AFL++")
+        dast = _run_dast_stage(context, sast, harness)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        artifact = _dast_artifact(dast)
+        _merge_review_payload(
+            task_id,
+            stage=stage,
+            result=_dast_result_to_dict(dast),
+            crash_hex=dast.crash_data.hex() if dast.crash_data else None,
+        )
+        _stage_waiting(task_id, stage, artifact)
+        return {"status": "waiting", "stage": stage}
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def run_review_patch_stage(self, task_id: str):
+    stage = "AI_PATCH"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        results = _load_stage_results(task_id)
+        sast = _sast_result_from_dict(results.get("sast") or {})
+        dast = _dast_result_from_dict(results.get("dast") or {})
+        _stage_running(task_id, stage, "Generating secure patch proposal")
+        patch_result = _run_ai_patch_stage(context, sast, dast)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        artifact = _patch_artifact(patch_result)
+        _merge_review_payload(
+            task_id,
+            stage=stage,
+            result=_patch_result_to_dict(patch_result),
+            patch_generated=True,
+            patch_code=patch_result.patch_code,
+        )
+        _stage_waiting(task_id, stage, artifact)
+        return {"status": "waiting", "stage": stage}
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def run_review_db_storage_stage(self, task_id: str):
+    stage = "DB_STORAGE"
+    if _is_review_cancelled(task_id):
+        return {"status": "cancelled"}
+    try:
+        context = _load_review_context(task_id)
+        results = _load_stage_results(task_id)
+        sast = _sast_result_from_dict(results.get("sast") or {})
+        dast = _dast_result_from_dict(results.get("dast") or {})
+        patch_result = _patch_result_from_dict(results.get("patch") or {})
+        _stage_running(task_id, stage, "Persisting approved pipeline result")
+        _run_db_storage_stage(context, sast, dast, patch_result)
+        if _is_review_cancelled(task_id):
+            return {"status": "cancelled"}
+        pipeline_result = _emit_pipeline_success(context, sast, dast, patch_result)
+        _merge_review_payload(
+            task_id,
+            stage="PIPELINE",
+            artifact={"type": "report", "title": "Pipeline review complete"},
+            current_stage="REPORT",
+            review_state="completed",
+            state="SUCCESS",
+            completed_at=datetime.utcnow(),
+        )
+        return pipeline_result
+    except Exception as e:
+        _fail_review_stage(task_id, stage, e)
+        raise
+
+
+@celery_app.task(bind=True)
+def cleanup_review_runtime(self, task_id: str, workspace_path: str | None = None):
+    if workspace_path:
+        shutil.rmtree(workspace_path, ignore_errors=True)
+    _cleanup_fuzzer_image(task_id)
+    return {"status": "cleaned"}
+
+
+def enqueue_review_stage(task_id: str, stage: str):
+    task_map = {
+        "INIT": run_review_init_stage,
+        "SAST": run_review_sast_stage,
+        "AI_HARNESS": run_review_harness_stage,
+        "DAST": run_review_dast_stage,
+        "AI_PATCH": run_review_patch_stage,
+        "DB_STORAGE": run_review_db_storage_stage,
+    }
+    task = task_map.get(stage)
+    if not task:
+        raise ValueError(f"Unsupported review stage: {stage}")
+    return task.apply_async((task_id,))
 
 
 def _run_pipeline_impl(task_id: str, repo_url: str):
@@ -1202,7 +1799,22 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
 
     # 1. Target Analysis & Build Context Setup
     build_dir = tempfile.mkdtemp(prefix="docker_build_")
-    if is_sample_repo_url(repo_url):
+    if is_inline_repo_url(repo_url):
+        workspace = review_workspace_path(task_id)
+        try:
+            shutil.copytree(
+                workspace,
+                build_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("my-db", "*.sarif", "outputs", "inputs"),
+            )
+        except Exception as e:
+            notify_status(
+                task_id, "ENV_GEN", "Failed", f"Failed to load inline source workspace: {e}"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            return {"status": "Failed", "error": f"Inline source load failed: {e}"}
+    elif is_sample_repo_url(repo_url):
         try:
             copy_sample_repo(repo_url, build_dir)
         except Exception as e:
@@ -1272,7 +1884,7 @@ def build_dynamic_fuzzing_env(self, repo_url: str, task_id: str):
         )
 
         # 2. Dependency Resolution via LLM
-        if is_sample_repo_url(repo_url):
+        if is_sample_repo_url(repo_url) or is_inline_repo_url(repo_url):
             llm_response = "pkg-config"
         else:
             prompt = f"""

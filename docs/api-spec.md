@@ -15,9 +15,14 @@ Submit a new pipeline job for a target GitHub repository.
 **Request**
 ```json
 {
-  "repo_url": "https://github.com/example/vulnerable-repo"
+  "repo_url": "https://github.com/example/vulnerable-repo",
+  "submitted_by": "user@example.com"
 }
 ```
+
+`submitted_by` is optional (defaults to `null`). It is stored for admin reporting only —
+it is **not** used for authentication. `repo_url` also accepts the `sample://` protocol for
+the bundled sample repositories (see Developer Lab Endpoints below).
 
 **Response 200**
 ```json
@@ -26,6 +31,8 @@ Submit a new pipeline job for a target GitHub repository.
   "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 }
 ```
+
+**Response 503** — the Celery broker is unavailable and the job could not be queued.
 
 ---
 
@@ -98,7 +105,7 @@ Connect to receive real-time pipeline events for all active jobs.
 
 ### Pinned Event Schema
 
-Every message is a JSON object. The base fields are always present; `vuln`, `result`, and `fuzz_stats` are **absent** (not null) on standard events and only included on the specific events that carry them.
+Every message is a JSON object. The base fields are always present; `vuln`, `result`, `fuzz_stats`, and `error_hint` are **absent** (not null) on standard events and only included on the specific events that carry them.
 
 ```json
 {
@@ -106,6 +113,8 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
   "step":    "INIT | SAST | AI_HARNESS | DAST | AI_PATCH | DB_STORAGE | ENV_GEN | PIPELINE",
   "status":  "Running | Success | Failed | Warning",
   "details": "string | null",
+
+  "error_hint": "string (actionable remediation hint; only on PIPELINE / Failed)",
 
   "vuln": {
     "message":      "string",
@@ -138,12 +147,12 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
 |------|-----------------|-----------------|
 | `INIT` | Running | — |
 | `SAST` | Running (streaming CodeQL output), **Success** | `vuln` on Success |
-| `AI_HARNESS` | Running, Success, Warning (compile retry) | — |
-| `DAST` | Running (poll every 10 s), Success (crash found), Failed | `fuzz_stats` on each Running poll |
+| `AI_HARNESS` | Running | — |
+| `DAST` | Running (compile + poll every 10 s), Warning (compile retry), Success (compile, then crash found), Failed (compile exhausted or timeout) | `fuzz_stats` on each Running poll |
 | `AI_PATCH` | Running, Success, Failed | — |
 | `DB_STORAGE` | Running | — |
 | `ENV_GEN` | Running, Success, Failed, Warning | — |
-| `PIPELINE` | **Success**, **Failed** | `result` on Success |
+| `PIPELINE` | **Success**, **Failed** | `result` on Success; `error_hint` on Failed (when present) |
 
 ---
 
@@ -210,8 +219,11 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
 
 | Code | Condition |
 |------|-----------|
+| 400 | `POST /api/dev/llm-settings` — `model` not in the allow-list |
 | 404 | `GET /api/jobs/{task_id}` — task_id not in job_store |
+| 409 | `GET /api/jobs/{task_id}/report` — job not yet complete (`X-Job-State` header carries the state) |
 | 422 | Malformed request body (FastAPI validation) |
+| 503 | `POST /api/jobs` — Celery broker unavailable, job not queued |
 
 ---
 
@@ -220,6 +232,11 @@ Every message is a JSON object. The base fields are always present; `vuln`, `res
 The Project Dashboard (`/dashboard`) consumes **only the shared `/ws` transport** for real-time updates — it does not open a second WebSocket or poll the REST endpoints during a live run. The REST endpoints (`GET /api/jobs`, `GET /api/jobs/{task_id}`) are available for page-load hydration or job history display.
 
 **Visualization library:** `recharts ^2.12.0` — `LineChart` for `fuzz_stats` (execs/crashes over time). Vulnerability details are rendered as Tailwind cards.
+
+> **Prototype:** `frontend/src/ReviewGatePrototype.jsx` (route `/dev/review-gate`) is a
+> **frontend-only design prototype** of a stage-gated review flow. It renders hardcoded mock
+> data and has **no backend wiring** — it does not call any REST endpoint or open the `/ws`
+> socket, and is not part of the live pipeline. Treat it as a UI mockup, not an API consumer.
 
 ---
 
@@ -271,6 +288,87 @@ Returns the full vulnerability report for a completed job, including the SARIF t
 
 **Response 404** — job not found  
 **Response 409** — job not yet complete; response header `X-Job-State` carries the current state (`PENDING | STARTED | FAILURE`)
+
+---
+
+## Developer Lab Endpoints
+
+The Developer Lab (`frontend/src/DevLab.jsx`) lets a developer pick the Gemini model, supply
+or clear an API key, toggle LLM-bypass (mock) mode, and choose a bundled sample repository —
+all at runtime, without restarting the worker. Settings are stored in the Redis key
+`dev:llm_config` and read by the Celery worker via `_get_dev_llm_config()` in `tasks.py`.
+
+> **Security note:** the API key is write-only over this API. It is persisted in Redis but
+> **never echoed back** — responses only report whether a key is set (`api_key_set`) and where
+> it came from (`api_key_source`).
+
+---
+
+### GET /api/dev/options
+
+Returns the available models, the current LLM settings, and the bundled sample repositories.
+
+**Response 200** — `DevOptionsResponse`
+```json
+{
+  "models": ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash"],
+  "default_model": "gemini-2.5-flash",
+  "llm": {
+    "model": "gemini-2.5-flash",
+    "api_key_set": true,
+    "api_key_source": "dev",
+    "bypass_llm": false
+  },
+  "sample_repos": [
+    {
+      "url": "sample://buffer-overflow",
+      "name": "Buffer Overflow Sample",
+      "description": "Tiny C project with argv/input taint reaching strcpy."
+    }
+  ]
+}
+```
+
+`models` is the server-side allow-list (`ALLOWED_GEMINI_MODELS` in `tasks.py`). A
+`sample_repos[].url` value can be submitted directly to `POST /api/jobs` as the `repo_url`.
+
+---
+
+### POST /api/dev/llm-settings
+
+Updates the runtime LLM configuration. The chosen `model` must be in the allow-list.
+
+**Request** — `DevLlmSettingsRequest`
+```json
+{
+  "model": "gemini-2.5-flash",
+  "api_key": "AIza...",
+  "clear_api_key": false,
+  "bypass_llm": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `gemini-2.5-flash` | Must be one of `ALLOWED_GEMINI_MODELS` |
+| `api_key` | string\|null | `null` | New Gemini API key; stored in Redis (ignored when `clear_api_key` is true) |
+| `clear_api_key` | boolean | `false` | Remove the stored dev API key (falls back to the `GEMINI_API_KEY` env var) |
+| `bypass_llm` | boolean | `false` | Use mock fixture files instead of calling Gemini (see `DEBUG_BYPASS_LLM`) |
+
+**Response 200** — `DevLlmSettingsResponse`
+```json
+{
+  "model": "gemini-2.5-flash",
+  "api_key_set": true,
+  "api_key_source": "dev",
+  "bypass_llm": false
+}
+```
+
+`api_key_source` is `"dev"` when a key is stored in Redis, `"env"` when only the
+`GEMINI_API_KEY` env var is set, or `null` when no key is available.
+
+**Response 400** — `{ "detail": "Unsupported Gemini model" }` when `model` is not in the allow-list.
 
 ---
 
@@ -453,3 +551,20 @@ All fields from `AdminJobSummary`, plus:
 (same node/edge shape; roles map `source`=entry `main`, `intermediate`=caller, `sink`=vulnerable fn).
 Both default to `{ "nodes": [], "edges": [] }` when unavailable.
 `diff.language` is inferred from `vuln_file` extension: `c`, `cpp`, or `plaintext`.
+
+---
+
+## Environment Variables
+
+The core service variables are listed in the root `CLAUDE.md`. The following additional
+variables are read by the worker but were not previously documented:
+
+| Variable | Read in | Default | Purpose |
+|----------|---------|---------|---------|
+| `GEMINI_MODEL` | `tasks.py`, `main.py` | `gemini-2.5-flash` | Fallback Gemini model when no dev config is stored; must be in `ALLOWED_GEMINI_MODELS` |
+| `CODEQL_THREADS` | `tasks.py` | `1` | `--threads` passed to `codeql database analyze` |
+| `CODEQL_RAM_MB` | `tasks.py` | `2048` | `--ram` (MB) passed to `codeql database analyze` |
+| `TCPDUMP_FUZZ_TIMEOUT` | `debug_tcpdump.py` | `90` | Seconds per fuzzing attempt in `DEBUG_TEST_TCPDUMP` resilience mode |
+| `TCPDUMP_FUZZ_ATTEMPTS` | `debug_tcpdump.py` | `6` | Number of fuzzing attempts in `DEBUG_TEST_TCPDUMP` resilience mode |
+
+See `docs/sast-analysis.md` and `docs/dynamic-analysis.md` for how these are used.

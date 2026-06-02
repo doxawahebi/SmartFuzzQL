@@ -158,8 +158,12 @@ Detailed reference documents live in `docs/`. Always consult these before adding
 
 | Document | Covers |
 |----------|--------|
-| `docs/api-spec.md` | All REST and admin endpoint contracts, schemas, error codes |
+| `docs/api-spec.md` | All REST, Developer Lab, and admin endpoint contracts, schemas, error codes, env vars |
 | `docs/websocket.md` | WebSocket event schema, step lifecycle, backend and frontend integration |
+| `docs/sast-analysis.md` | SAST stage: CodeQL two-pass analysis, query packs, taint/call-path graphs |
+| `docs/dynamic-analysis.md` | AI_HARNESS + DAST + ENV_GEN: harness generation, Docker env build, AFL++ fuzzing, `sample://` protocol |
+| `docs/auto-remediation.md` | AI_PATCH stage: patch generation, persistence, report rendering |
+| `docs/auto-remediation-gaps.md` | Known limitations of the patching stage |
 
 Sub-CLAUDE.md files with per-directory guidance:
 

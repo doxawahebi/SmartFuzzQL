@@ -37,7 +37,7 @@ Browser: ws.onmessage handler
 
 ## Event Schema
 
-Every message is a UTF-8 JSON object. **Base fields are always present.** Optional fields (`vuln`, `result`, `fuzz_stats`) are **absent** (not `null`) on events that do not carry them — check with `"vuln" in data`, not `data.vuln !== null`.
+Every message is a UTF-8 JSON object. **Base fields are always present.** Optional fields (`vuln`, `result`, `fuzz_stats`, `error_hint`) are **absent** (not `null`) on events that do not carry them — check with `"vuln" in data`, not `data.vuln !== null`.
 
 ```json
 {
@@ -45,6 +45,8 @@ Every message is a UTF-8 JSON object. **Base fields are always present.** Option
   "step":    "INIT | SAST | AI_HARNESS | DAST | AI_PATCH | DB_STORAGE | ENV_GEN | PIPELINE",
   "status":  "Running | Success | Failed | Warning",
   "details": "string | null",
+
+  "error_hint": "string (actionable remediation hint; only on PIPELINE / Failed)",
 
   "vuln": {
     "message":      "string",
@@ -80,6 +82,7 @@ Every message is a UTF-8 JSON object. **Base fields are always present.** Option
 | `vuln` | object | Only present on `SAST / Success` — CodeQL finding |
 | `result` | object | Only present on `PIPELINE / Success` — final pipeline result |
 | `fuzz_stats` | object | Only present on `DAST / Running` polling events |
+| `error_hint` | string | Only present on `PIPELINE / Failed` when the failure was a `PipelineUserError` — an actionable remediation hint (e.g. "Lower CODEQL_RAM_MB…"). May be `null` if the error carried no hint. The dashboard renders it alongside the error detail. |
 
 ---
 
@@ -89,12 +92,12 @@ Every message is a UTF-8 JSON object. **Base fields are always present.** Option
 |------|-----------------|-----------------|-------|
 | `INIT` | Running | — | Job acknowledged, pipeline starting |
 | `SAST` | Running, **Success**, Failed | `vuln` on Success | Streams CodeQL output; `vuln` carries the taint finding |
-| `AI_HARNESS` | Running, Success, Warning | — | Warning = compile retry (up to 3); compiler stderr fed back to LLM |
-| `DAST` | Running (poll every 10 s), Success, Failed | `fuzz_stats` on each Running poll | Success = AFL++ found a crash |
+| `AI_HARNESS` | Running | — | LLM generates the AFL++ persistent-mode harness |
+| `DAST` | Running, Warning, Success, Failed | `fuzz_stats` on each Running poll | Covers both **compile** and **fuzz**: Warning on each failed compile (up to 3 LLM-feedback retries; compiler stderr fed back to LLM), Success on compile and again when AFL++ finds a crash, Failed on compile exhaustion or fuzz timeout. `fuzz_stats` accompanies each 10 s poll. See `docs/dynamic-analysis.md` |
 | `AI_PATCH` | Running, Success, Failed | — | LLM generates the patch |
 | `DB_STORAGE` | Running | — | Persisting results to PostgreSQL |
 | `ENV_GEN` | Running, Success, Failed, Warning | — | Docker image build for the fuzzing environment |
-| `PIPELINE` | **Success**, **Failed** | `result` on Success | Terminal event; `result` carries the full outcome |
+| `PIPELINE` | **Success**, **Failed** | `result` on Success; `error_hint` on Failed | Terminal event. `result` carries the full outcome on success; on a `PipelineUserError` failure, `error_hint` carries a remediation hint |
 
 ---
 

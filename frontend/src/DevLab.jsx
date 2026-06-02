@@ -109,6 +109,7 @@ const DevLab = () => {
         <Breadcrumb />
         <div className="flex items-center gap-3 text-xs">
           <Link to="/dashboard" className="text-gray-400 hover:text-blue-300">Dashboard</Link>
+          <Link to="/dev/review-gate" className="text-gray-400 hover:text-blue-300">Review Prototype</Link>
           <Link to="/admin/dashboard" className="text-gray-400 hover:text-blue-300">Admin</Link>
         </div>
       </div>

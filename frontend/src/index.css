@@ -6,3 +6,18 @@
 .report-selected-line {
   background: rgba(251, 191, 36, 0.15) !important;
 }
+
+.review-prototype-card {
+  animation: review-prototype-card-enter 180ms ease-out;
+}
+
+@keyframes review-prototype-card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

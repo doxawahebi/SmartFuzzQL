@@ -15,6 +15,51 @@ const ROLE_STYLE = {
   sink:         { border: '2px solid #ef4444', background: '#450a0a', color: '#fecaca' },
 };
 
+const PROTOTYPE_REPORT = {
+  task_id: 'prototype-review',
+  vuln_summary: {
+    file: 'src/vuln.c',
+    message: 'Unsafe buffer write: user-controlled input reaches strcpy.',
+  },
+  taint_path: {
+    nodes: [
+      { id: 'source', label: 'argv[1]', role: 'source', file: 'src/main.c', start_line: 8 },
+      { id: 'param', label: 'display_user_name(name)', role: 'intermediate', file: 'src/vuln.c', start_line: 1 },
+      { id: 'sink', label: 'strcpy(display_name, name)', role: 'sink', file: 'src/vuln.c', start_line: 4 },
+    ],
+    edges: [
+      { id: 'source-param', source: 'source', target: 'param' },
+      { id: 'param-sink', source: 'param', target: 'sink' },
+    ],
+  },
+  call_path: {
+    nodes: [
+      { id: 'main', label: 'main', role: 'source', file: 'src/main.c', start_line: 4 },
+      { id: 'display', label: 'display_user_name', role: 'sink', file: 'src/vuln.c', start_line: 1 },
+    ],
+    edges: [{ id: 'main-display', source: 'main', target: 'display' }],
+  },
+  diff: {
+    language: 'c',
+    original: `void display_user_name(const char *name) {
+    char display_name[16];
+
+    strcpy(display_name, name);
+    printf("hello, %s\\n", display_name);
+}`,
+    patched: `void display_user_name(const char *name) {
+    char display_name[16];
+
+    strncpy(display_name, name, sizeof(display_name) - 1);
+    display_name[sizeof(display_name) - 1] = '\\0';
+    printf("hello, %s\\n", display_name);
+}`,
+  },
+  crash: {
+    hex: '4141414141414141414141414141414100',
+  },
+};
+
 function applyDagreLayout(nodes, edges) {
   const g = new dagre.graphlib.Graph();
   g.setGraph({ rankdir: 'TB', nodesep: 60, ranksep: 80 });
@@ -40,6 +85,14 @@ const ReportViewer = () => {
   const decorationsRef = useRef([]);
 
   useEffect(() => {
+    setLoading(true);
+    setError(null);
+    if (id === PROTOTYPE_REPORT.task_id) {
+      setReport(PROTOTYPE_REPORT);
+      setLoading(false);
+      return;
+    }
+
     const apiHost = window.location.hostname;
     fetch(`${window.location.protocol}//${apiHost}:8000/api/jobs/${id}/report`)
       .then(r => {

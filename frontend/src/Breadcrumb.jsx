@@ -7,6 +7,7 @@ const LABELS = {
   admin: 'Admin',
   dev: 'Developer',
   lab: 'Lab',
+  'review-gate': 'Review Gate',
 };
 
 const Breadcrumb = () => {

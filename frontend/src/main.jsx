@@ -5,6 +5,7 @@ import Dashboard from './Dashboard.jsx'
 import ReportViewer from './ReportViewer.jsx'
 import AdminDashboard from './AdminDashboard.jsx'
 import DevLab from './DevLab.jsx'
+import ReviewGatePrototype from './ReviewGatePrototype.jsx'
 import './index.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
@@ -17,6 +18,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
       <Route path="/admin/dashboard" element={<AdminDashboard />} />
       <Route path="/dev" element={<Navigate to="/dev/lab" replace />} />
       <Route path="/dev/lab" element={<DevLab />} />
+      <Route path="/dev/review-gate" element={<ReviewGatePrototype />} />
     </Routes>
   </BrowserRouter>,
 )

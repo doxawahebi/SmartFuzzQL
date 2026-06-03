@@ -21,7 +21,7 @@ report viewer renders. It is the counterpart to `docs/auto-remediation.md` (stag
 
 | Pass | Queries dir | Output | Failure behaviour |
 |------|-------------|--------|-------------------|
-| 1 — vulnerabilities | `backend/queries/vulnerabilities/` | `sarif_path` | **Fatal** — raises; pipeline aborts |
+| 1 — vulnerabilities | `backend/queries/vulnerabilities/` | `sarif_path` | Raises — caught by `_run_sast_stage`, which falls back to Joern (see [Hybrid Engine](#hybrid-engine-joern-fallback)) |
 | 2 — call graph | `backend/queries/callgraph/` | `callgraph_sarif_path` | **Non-fatal** — emits `SAST / Warning` and continues |
 
 The passes live in separate subdirectories of the same pack so each `codeql database analyze`
@@ -39,7 +39,57 @@ a 15-second heartbeat when a command is quiet ("…still running… elapsed=Ns, 
 output for Ms") so the dashboard never looks stalled during a long database build.
 
 On success the stage emits `SAST / Success` with the `vuln` enrichment field (message, file,
-first 500 chars of the vulnerable file).
+first 500 chars of the vulnerable file). The `details` string names the engine that produced
+the finding (`Found vulnerability via CODEQL: …` or `… via JOERN: …`).
+
+---
+
+## Hybrid Engine: Joern Fallback
+
+CodeQL only finds bugs when it can build a usable database. The CLI compiles the target
+(`codeql database create … --command="make"`), so a target that won't build aborts the run;
+the backend uses `--build-mode=none`, which never compiles but frequently extracts *nothing*
+for non-trivial C/C++. Either way CodeQL can come up empty.
+
+**Joern** is wired in as a build-free fallback. It extracts an AST/CFG/CPG directly from source
+with its fuzzy C/C++ parser (c2cpg) — **no compilation, no headers, no build system**.
+
+**When Joern runs** (`_run_sast_stage` in `tasks.py`; `step_2_static_analysis` in `pipeline.py`):
+
+1. CodeQL runs first (unless `JOERN_FORCE=True`).
+2. If CodeQL **raises** (e.g. the CLI's `make` build fails) **or returns zero vuln findings**,
+   and `JOERN_FALLBACK` is enabled (default), Joern takes over.
+3. The pipeline never aborts at the SAST stage on a build failure — it degrades to Joern.
+
+**How it stays drop-in compatible.** Joern's findings are converted into the **exact SARIF
+shape CodeQL emits** and written to the same `sarif_path` / `callgraph_sarif_path`. Every
+downstream consumer (`_select_vulnerability`, `_select_taint_result` / `_extract_taint_path`,
+`_parse_call_edges` / `_extract_call_path`, `SastStageResult`, and all later stages) is
+unchanged — it cannot tell which engine produced the SARIF.
+
+| Piece | Location | Role |
+|-------|----------|------|
+| `joern/extract_vulns.sc` | `backend/joern/` | Joern Scala script: imports source, runs taint flows + call edges, writes neutral `joern_raw.json` |
+| `joern_raw_to_sarif()` | `backend/joern_analysis.py` | Pure adapter: neutral JSON → `(vuln_sarif, callgraph_sarif)` matching CodeQL; normalizes paths to repo-relative URIs |
+| `run_joern_analysis()` | `backend/joern_analysis.py` | Runs Joern, calls the adapter, writes both SARIF files (shared by backend + CLI) |
+
+The Joern script mirrors the CodeQL queries it replaces: the same dangerous sinks and untrusted
+input sources (defined once in `joern_analysis.DANGEROUS_FUNCS` / `INPUT_SOURCE_FUNCS` and
+passed to the script as `--param`, so `tasks.py`, the queries, and Joern never drift) and the
+same `cpp/taint-buffer-overflow` / `cpp/call-graph-edges` rule ids. The `bootp_print` structural
+query is **not** ported to Joern.
+
+**Environment toggles:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `JOERN_FALLBACK` | `True` | Enable the Joern fallback. Set `False` to keep CodeQL-only behaviour. |
+| `JOERN_FORCE` | `False` | Skip CodeQL and run Joern directly (for testing the Joern path). |
+
+Joern (CLI + JVM) is installed into both images at `/opt/joern/joern-cli` (see
+`backend/Dockerfile` and the root `Dockerfile`); it needs JDK ≥ 17. The unit tests in
+`backend/test_joern.py` prove the adapter's SARIF is consumable by the real downstream parsers
+without needing Joern or Docker installed.
 
 ---
 

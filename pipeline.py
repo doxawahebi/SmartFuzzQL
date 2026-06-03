@@ -17,6 +17,7 @@ WORKSPACE_DIR = os.path.abspath(os.path.dirname(__file__))
 # patch prompt and one function-scoped diff implementation (see backend/patching.py).
 sys.path.insert(0, os.path.join(WORKSPACE_DIR, "backend"))
 import patching  # noqa: E402
+import joern_analysis  # noqa: E402  (build-free SAST fallback when the target won't build)
 
 DOCKER_IMAGE = "hast-env"
 CONTAINER_NAME = "hast-container"
@@ -87,6 +88,50 @@ def step_1_setup_environment():
     )
 
 
+def _sarif_has_results():
+    """True if the workspace results.sarif exists and has at least one finding."""
+    sarif_path = os.path.join(WORKSPACE_DIR, SARIF_OUTPUT)
+    if not os.path.exists(sarif_path):
+        return False
+    try:
+        with open(sarif_path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    return bool(data.get("runs", [{}])[0].get("results", []))
+
+
+def _run_joern_fallback(container_repo_path):
+    """Run Joern inside the container (no build needed) and write a CodeQL-shaped
+    results.sarif so the rest of the pipeline proceeds unchanged."""
+    print("[+] Falling back to Joern (build-free CPG extraction)...")
+    sinks = ",".join(sorted(joern_analysis.DANGEROUS_FUNCS))
+    sources = ",".join(sorted(joern_analysis.INPUT_SOURCE_FUNCS))
+    raw_host_path = os.path.join(WORKSPACE_DIR, joern_analysis.JOERN_RAW_FILENAME)
+    run_cmd(f"docker exec {CONTAINER_NAME} rm -f /workspace/{joern_analysis.JOERN_RAW_FILENAME}", check=False)
+    res = run_cmd(
+        f"docker exec {CONTAINER_NAME} joern --script /workspace/backend/joern/extract_vulns.sc "
+        f"--param inDir={container_repo_path} --param outDir=/workspace "
+        f"--param sinks={sinks} --param sources={sources}",
+        check=False,
+    )
+    if res.returncode != 0 or not os.path.exists(raw_host_path):
+        print("[!] Joern extraction failed; no static findings available.")
+        return
+    with open(raw_host_path, "r") as f:
+        raw = json.load(f)
+    # inDir is the container path, so Joern's file paths are normalized against it to
+    # produce repo-relative URIs that step_3/step_5 join onto the host repo_dir.
+    vuln_sarif, _callgraph = joern_analysis.joern_raw_to_sarif(
+        raw, import_root=container_repo_path
+    )
+    with open(os.path.join(WORKSPACE_DIR, SARIF_OUTPUT), "w") as f:
+        json.dump(vuln_sarif, f)
+    print(
+        f"    - Joern produced {len(vuln_sarif['runs'][0]['results'])} finding(s)."
+    )
+
+
 def step_2_static_analysis(repo_dir):
     print("[+] Step 2: Creating CodeQL Database...")
     rel_repo = os.path.basename(repo_dir)
@@ -96,25 +141,43 @@ def step_2_static_analysis(repo_dir):
     run_cmd(f"docker exec {CONTAINER_NAME} make clean", check=False)
     run_cmd(f"docker exec {CONTAINER_NAME} rm -rf {DB_NAME} {SARIF_OUTPUT}")
 
-    # Run configure before codeql if a configure script exists, or let CodeQL build it
-    run_cmd(
-        f"docker exec {CONTAINER_NAME} sh -c 'cd {container_repo_path} && if [ -f configure ]; then ./configure; fi'",
-        check=False,
-    )
+    fallback_enabled = os.environ.get("JOERN_FALLBACK", "True") != "False"
+    force_joern = os.environ.get("JOERN_FORCE", "False") == "True"
 
-    run_cmd(
-        f'docker exec {CONTAINER_NAME} codeql database create {DB_NAME} --language=cpp --source-root={container_repo_path} --command="make"'
-    )
+    codeql_ok = False
+    if not force_joern:
+        # Run configure before codeql if a configure script exists, or let CodeQL build it
+        run_cmd(
+            f"docker exec {CONTAINER_NAME} sh -c 'cd {container_repo_path} && if [ -f configure ]; then ./configure; fi'",
+            check=False,
+        )
 
-    print("[+] Running custom CodeQL query...")
-    # download dependencies (codeql/cpp-all powers the DataFlow taint query)
-    run_cmd(
-        f"docker exec {CONTAINER_NAME} codeql pack install /workspace/backend/queries"
-    )
-    # Vulnerability-finding queries only; the call-graph query is a separate concern.
-    run_cmd(
-        f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} /workspace/backend/queries/vulnerabilities --format=sarif-latest --output={SARIF_OUTPUT}"
-    )
+        # CodeQL needs a working build. A build failure is non-fatal (check=False) so the
+        # pipeline can fall back to Joern instead of aborting at sys.exit.
+        create_res = run_cmd(
+            f'docker exec {CONTAINER_NAME} codeql database create {DB_NAME} --language=cpp --source-root={container_repo_path} --command="make"',
+            check=False,
+        )
+        if create_res.returncode == 0:
+            print("[+] Running custom CodeQL query...")
+            # download dependencies (codeql/cpp-all powers the DataFlow taint query)
+            run_cmd(
+                f"docker exec {CONTAINER_NAME} codeql pack install /workspace/backend/queries",
+                check=False,
+            )
+            # Vulnerability-finding queries only; the call-graph query is a separate concern.
+            analyze_res = run_cmd(
+                f"docker exec {CONTAINER_NAME} codeql database analyze {DB_NAME} /workspace/backend/queries/vulnerabilities --format=sarif-latest --output={SARIF_OUTPUT}",
+                check=False,
+            )
+            codeql_ok = analyze_res.returncode == 0 and _sarif_has_results()
+            if not codeql_ok:
+                print("[!] CodeQL found nothing or analysis failed.")
+        else:
+            print("[!] CodeQL database build failed (target may not compile).")
+
+    if not codeql_ok and (force_joern or fallback_enabled):
+        _run_joern_fallback(container_repo_path)
 
 
 def call_llm_api(prompt):

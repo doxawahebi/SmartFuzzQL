@@ -21,7 +21,8 @@ SAST의 Source-code level analysis 결과를 LLM에 주입하여 Fuzzing Harness
 1. **One-Click Targeting**
    - 대시보드에 GitHub Repository URL을 입력하는 것만으로 전체 분석 파이프라인이 시작됩니다.
 2. **SAST Analysis**
-   - 백엔드에서 격리된 Docker 컨테이너를 생성하고, Joern/CodeQL을 이용해 Source-code level analysis를 수행합니다.
+   - 백엔드에서 격리된 Docker 컨테이너를 생성하고, CodeQL을 이용해 Source-code level analysis를 수행합니다.
+   - CodeQL이 Target Build에 실패하거나 결과를 찾지 못하면, 컴파일 없이 AST/CFG/CPG를 추출하는 **Joern**으로 자동 Fallback하여 파이프라인이 중단되지 않습니다 (Hybrid SAST).
 3. **Harness Generation & Feedback-Loop:**
    - LLM이 Harness 코드를 생성하며, Error 발생 시 컴파일러 로그를 바탕으로 스스로 코드를 수정하는 Feedback Loop를 실행합니다.
 6. **Automated Crash Verification**

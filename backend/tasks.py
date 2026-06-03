@@ -31,6 +31,7 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
 import patching  # noqa: E402  (after sys.path pin so the sibling module always resolves)
+import joern_analysis  # noqa: E402  (build-free SAST fallback; see _run_sast_stage)
 
 # Pre-load the DB modules in the worker MainProcess so they live in sys.modules and the
 # lazy `from database import ...` inside the task is fully independent of cwd/sys.path in
@@ -547,9 +548,10 @@ def _extract_taint_path(sarif_result: dict) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-# Dangerous C string sinks (kept in sync with backend/queries/*.ql DangerousFunction).
-DANGEROUS_FUNCS = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf"}
-CALL_EDGE_RULE_ID = "cpp/call-graph-edges"
+# Dangerous C string sinks and the call-edge rule id. Sourced from joern_analysis so the
+# CodeQL queries (backend/queries/*.ql), the Joern fallback, and this parser never drift.
+DANGEROUS_FUNCS = joern_analysis.DANGEROUS_FUNCS
+CALL_EDGE_RULE_ID = joern_analysis.CALL_EDGE_RULE_ID
 
 
 def _parse_call_edges(sarif_results: list) -> tuple:
@@ -1166,30 +1168,93 @@ def _read_vulnerable_code(repo_path: str, vuln_file: str) -> str:
     return CODE_NOT_FOUND
 
 
+def _sast_vuln_results(sarif_path: str) -> list:
+    """Read the vulnerability SARIF and return its vuln results (call edges filtered
+    out defensively), or [] if the file is missing/unreadable."""
+    if not os.path.exists(sarif_path):
+        return []
+    try:
+        with open(sarif_path, "r") as f:
+            sarif_data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    all_results = sarif_data.get("runs", [{}])[0].get("results", [])
+    return [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
+
+
 def _run_sast_stage(context: PipelineContext) -> SastStageResult:
-    notify_status(
-        context.task_id,
-        "SAST",
-        "Running",
-        "Cloning and extracting source-level logical vulnerabilities via CodeQL",
-    )
     db_path = os.path.join(context.temp_dir, "my-db")
     sarif_path = os.path.join(context.temp_dir, "results.sarif")
     callgraph_sarif_path = os.path.join(context.temp_dir, "callgraph.sarif")
-    run_codeql_analysis(
-        context.task_id, context.temp_dir, db_path, sarif_path, callgraph_sarif_path
-    )
 
-    with open(sarif_path, "r") as f:
-        sarif_data = json.load(f)
+    fallback_enabled = os.environ.get("JOERN_FALLBACK", "True") != "False"
+    force_joern = os.environ.get("JOERN_FORCE", "False") == "True"
+
+    engine = "codeql"
+    codeql_ok = False
+    if not force_joern:
+        notify_status(
+            context.task_id,
+            "SAST",
+            "Running",
+            "Cloning and extracting source-level logical vulnerabilities via CodeQL",
+        )
+        try:
+            run_codeql_analysis(
+                context.task_id,
+                context.temp_dir,
+                db_path,
+                sarif_path,
+                callgraph_sarif_path,
+            )
+            # CodeQL needs a usable build/extraction; --build-mode=none can succeed yet
+            # find nothing. Treat an empty result set as a CodeQL miss so Joern can try.
+            codeql_ok = bool(_sast_vuln_results(sarif_path))
+            if not codeql_ok:
+                notify_status(
+                    context.task_id,
+                    "SAST",
+                    "Warning",
+                    "CodeQL produced no findings; falling back to Joern (build-free CPG)",
+                )
+        except Exception as e:
+            notify_status(
+                context.task_id,
+                "SAST",
+                "Warning",
+                f"CodeQL analysis failed ({e}); falling back to Joern (build-free CPG)",
+            )
+
+    # Joern extracts AST/CFG/CPG straight from source with no compilation, so it can
+    # find the same vulnerability classes when CodeQL's build/extraction comes up empty.
+    if force_joern or (not codeql_ok and fallback_enabled):
+        engine = "joern"
+        notify_status(
+            context.task_id,
+            "SAST",
+            "Running",
+            "Extracting AST/CFG via Joern (no build required)",
+        )
+        try:
+            joern_analysis.run_joern_analysis(
+                context.task_id,
+                context.repo_path,
+                sarif_path,
+                callgraph_sarif_path,
+                out_dir=context.temp_dir,
+                notify=lambda line: notify_status(
+                    context.task_id, "SAST", "Running", line
+                ),
+            )
+        except Exception as e:
+            notify_status(
+                context.task_id, "SAST", "Warning", f"Joern fallback failed: {e}"
+            )
 
     call_edge_results = _load_call_edge_results(
         context.task_id, callgraph_sarif_path
     )
-    all_results = sarif_data.get("runs", [{}])[0].get("results", [])
-    # The vuln pass no longer emits call edges, but filter defensively in case the
-    # pack layout changes and both query sets land in one SARIF.
-    results = [r for r in all_results if r.get("ruleId") != CALL_EDGE_RULE_ID]
+    results = _sast_vuln_results(sarif_path)
     console.print(f"results : {results}")
     vuln_msg, vuln_file, vuln_line = _select_vulnerability(results)
     vuln_code = _read_vulnerable_code(context.repo_path, vuln_file)
@@ -1199,7 +1264,7 @@ def _run_sast_stage(context: PipelineContext) -> SastStageResult:
         context.task_id,
         "SAST",
         "Success",
-        f"Found vulnerability: {vuln_msg} in {vuln_file}",
+        f"Found vulnerability via {engine.upper()}: {vuln_msg} in {vuln_file}",
         extra={
             "vuln": {
                 "message": vuln_msg,

@@ -40,6 +40,10 @@ services:
       # stage still runs; mocks fire only on failure so the job always reaches SUCCESS.
       # Independent of DEBUG_BYPASS_LLM. Set to True to enable.
       - DEBUG_TEST_TCPDUMP=${DEBUG_TEST_TCPDUMP:-False}
+      # Joern is a build-free SAST fallback used when CodeQL fails to build or finds nothing.
+      - JOERN_FALLBACK=${JOERN_FALLBACK:-True}
+      # Skip CodeQL and run Joern directly (for testing the Joern path).
+      - JOERN_FORCE=${JOERN_FORCE:-False}
 
   redis:
     image: redis:alpine

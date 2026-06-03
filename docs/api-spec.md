@@ -668,6 +668,8 @@ variables are read by the worker but were not previously documented:
 | `GEMINI_MODEL` | `tasks.py`, `main.py` | `gemini-2.5-flash` | Fallback Gemini model when no dev config is stored; must be in `ALLOWED_GEMINI_MODELS` |
 | `CODEQL_THREADS` | `tasks.py` | `1` | `--threads` passed to `codeql database analyze` |
 | `CODEQL_RAM_MB` | `tasks.py` | `2048` | `--ram` (MB) passed to `codeql database analyze` |
+| `JOERN_FALLBACK` | `tasks.py`, `pipeline.py` | `True` | Run the build-free Joern fallback when CodeQL fails or finds nothing. `False` = CodeQL-only |
+| `JOERN_FORCE` | `tasks.py`, `pipeline.py` | `False` | Skip CodeQL and run Joern directly (testing the Joern path) |
 | `TCPDUMP_FUZZ_TIMEOUT` | `debug_tcpdump.py` | `90` | Seconds per fuzzing attempt in `DEBUG_TEST_TCPDUMP` resilience mode |
 | `TCPDUMP_FUZZ_ATTEMPTS` | `debug_tcpdump.py` | `6` | Number of fuzzing attempts in `DEBUG_TEST_TCPDUMP` resilience mode |
 

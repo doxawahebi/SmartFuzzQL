@@ -166,6 +166,7 @@ Detailed reference documents live in `docs/`. Always consult these before adding
 | `docs/dynamic-analysis.md` | AI_HARNESS + DAST + ENV_GEN: harness generation, Docker env build, AFL++ fuzzing, `sample://` protocol |
 | `docs/auto-remediation.md` | AI_PATCH stage: patch generation, persistence, report rendering |
 | `docs/auto-remediation-gaps.md` | Known limitations of the patching stage |
+| `docs/database-schema.md` | `jobs` table schema, columns, states, JSON shapes, how to inspect the DB |
 
 Sub-CLAUDE.md files with per-directory guidance:
 

@@ -11,6 +11,7 @@ Always consult these before adding or changing endpoints or event shapes:
 | `docs/sast-analysis.md` | SAST stage: CodeQL two-pass analysis, query packs, taint/call-path graphs |
 | `docs/dynamic-analysis.md` | AI_HARNESS + DAST + ENV_GEN: harness generation, Docker env build, AFL++ fuzzing, `sample://` protocol |
 | `docs/auto-remediation.md` | AI_PATCH stage: patch generation, persistence, report rendering |
+| `docs/database-schema.md` | `jobs` table schema, columns, states, JSON shapes, how to inspect the DB |
 
 ## Key Rules
 

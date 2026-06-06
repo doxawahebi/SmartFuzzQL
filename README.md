@@ -45,6 +45,19 @@ SAST의 Source-code level analysis 결과를 LLM에 주입하여 Fuzzing Harness
   - **Left Panel (React Flow):** SAST가 탐지한 Source-to-Sink Data Flow Path를 Node-Edge 형태의 Interactive Graph로 시각화
   - **Right Panel (Monaco Editor):** 원본 Vulnerable Code와 LLM이 제안한 Patch Code를 비교하는 Diff Editor 뷰
 
+## Documentation
+
+개발자 문서는 [`docs/`](docs/README.md)에 정리되어 있습니다 (영문). 처음이라면
+[Getting Started](docs/getting-started.md)부터 시작하세요.
+
+- [docs/README.md](docs/README.md) — 전체 문서 인덱스
+- [Getting Started](docs/getting-started.md) — 설치 및 최초 실행 (quickstart)
+- [Architecture](docs/architecture.md) + [ADRs](docs/adr/README.md) — 시스템 구조와 설계 결정
+- [API](docs/api-spec.md) · [WebSocket](docs/websocket.md) · [Configuration](docs/configuration.md) · [Database](docs/database-schema.md) — 레퍼런스
+- [How-to](docs/how-to.md) · [Examples](docs/examples.md) — 작업별 가이드
+- [Operations](docs/operations.md) — 배포 · 모니터링 · 트러블슈팅
+- [CONTRIBUTING](CONTRIBUTING.md) · [CHANGELOG](CHANGELOG.md) · [SECURITY](SECURITY.md)
+
 ## Tech Stack
 
 ### Frontend

@@ -156,17 +156,30 @@ Both `pipeline.py` and `backend/tasks.py` call Gemini via `google-genai`. The mo
 
 ## Documentation
 
-Detailed reference documents live in `docs/`. Always consult these before adding or changing API or WebSocket behaviour:
+Detailed developer documentation lives in `docs/`. **`docs/README.md` is the index** — it maps
+every doc by category (onboarding, architecture, reference, how-to, operations, meta). Always
+consult these before adding or changing API or WebSocket behaviour:
 
 | Document | Covers |
 |----------|--------|
+| `docs/README.md` | Documentation index / map — start here |
+| `docs/getting-started.md` | Quickstart: prerequisites, install, a minimal run to a SUCCESS report |
+| `docs/architecture.md` | System topology, pipeline flow, core abstractions, classic vs review mode |
+| `docs/adr/` | Architecture Decision Records — the *why* behind the big tradeoffs |
 | `docs/api-spec.md` | All REST, Developer Lab, and admin endpoint contracts, schemas, error codes, env vars |
 | `docs/websocket.md` | WebSocket event schema, step lifecycle, backend and frontend integration |
+| `docs/configuration.md` | Consolidated environment-variable and configuration reference |
 | `docs/sast-analysis.md` | SAST stage: CodeQL two-pass analysis, query packs, taint/call-path graphs |
 | `docs/dynamic-analysis.md` | AI_HARNESS + DAST + ENV_GEN: harness generation, Docker env build, AFL++ fuzzing, `sample://` protocol |
 | `docs/auto-remediation.md` | AI_PATCH stage: patch generation, persistence, report rendering |
-| `docs/auto-remediation-gaps.md` | Known limitations of the patching stage |
 | `docs/database-schema.md` | `jobs` table schema, columns, states, JSON shapes, how to inspect the DB |
+| `docs/how-to.md` | Task recipes: add a query/endpoint/component/stage, run debug mode |
+| `docs/examples.md` | Copy-pasteable curl, WebSocket, and CLI snippets |
+| `docs/operations.md` | Deployment, monitoring, troubleshooting, and the error catalog |
+| `docs/glossary.md` / `docs/faq.md` | Domain terms and recurring-question answers |
+
+Root-level developer docs: `CONTRIBUTING.md` (dev setup, tests, style, PR conventions),
+`CHANGELOG.md` (notable changes + contract/deprecation policy), `SECURITY.md` (reporting policy).
 
 Sub-CLAUDE.md files with per-directory guidance:
 

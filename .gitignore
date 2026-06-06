@@ -48,3 +48,9 @@ libpcap-1.8.0/
 .runtime/
 backend/.runtime/
 docs/오픈소스SW기초_제안서_김찬_윤종현-1 (1).pdf
+
+# joern
+joern-sast/
+
+# wokrspace
+workspace/
